@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Enhanced Opponent pool with fixed checkpoint loading.
-- Proper device handling
+Enhanced Opponent pool with fixed checkpoint loading and MPS support.
+- Proper device handling (CUDA/MPS/CPU)
 - Error recovery
 - Better logging
 """
@@ -14,12 +14,28 @@ import importlib
 import torch
 
 
+def get_device():
+    """
+    Automatically detect and return the best available device.
+    Priority: CUDA > MPS > CPU
+    
+    Returns:
+        str: Device string ('cuda', 'mps', or 'cpu')
+    """
+    if torch.cuda.is_available():
+        return "cuda"
+    elif torch.backends.mps.is_available():
+        return "mps"
+    else:
+        return "cpu"
+
+
 class OpponentPool:
     """
     Manages a pool of frozen agent checkpoints for opponent sampling.
     
     IMPROVEMENTS:
-    - Fixed device handling for loaded opponents
+    - Fixed device handling for loaded opponents (CUDA/MPS/CPU)
     - Error recovery when loading fails
     - Better logging and diagnostics
     """
@@ -41,7 +57,7 @@ class OpponentPool:
         self._snapshot_counter = 0
         
         # Determine device for opponents
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.device = get_device()
 
         self._load_existing_snapshots()
         random.seed(seed)

@@ -3,6 +3,7 @@
 """
 PyTorch PPO agent for Backgammon with legal move masking
 Class-based design for independent agent instances
+Updated with MPS (Apple GPU) support for M1/M2 Macs
 """
 
 from pathlib import Path
@@ -21,7 +22,7 @@ np.random.seed(42)
 # ---------------- Config ----------------
 class Config:
     """Base configuration class."""
-    state_dim = 29
+    state_dim = 30  # 29 board positions + 1 moves_left counter
     max_actions = 64  # For padding, not actual head size
     
     # PPO hyperparameters
@@ -92,6 +93,7 @@ class MediumConfig(Config):
     
     Use for:
     - T4 GPU (Google Colab free tier)
+    - M1/M2 Mac with MPS
     - Limited GPU time
     - Good balance of speed/performance
     """
@@ -155,12 +157,30 @@ def get_config(size='large'):
 # Default config instance
 CFG = Config()
 
-# Set device at module level
-if torch.cuda.is_available():
-    CFG.device = "cuda"
-else:
-    CFG.device = "cpu"
 
+def get_device():
+    """
+    Automatically detect and return the best available device.
+    Priority: CUDA > MPS > CPU
+    
+    Note: All MPS numerical stability issues have been fixed by:
+    - Removing LayerNorm
+    - Using -1e9 instead of -inf for masking
+    - Proper weight initialization
+    
+    Returns:
+        str: Device string ('cuda', 'mps', or 'cpu')
+    """
+    if torch.cuda.is_available():
+        return "cuda"
+    elif torch.backends.mps.is_available():
+        return "mps"
+    else:
+        return "cpu"
+
+
+# Set device at module level
+CFG.device = get_device()
 print(f"PPO agent using device: {CFG.device}")
 
 
@@ -224,454 +244,396 @@ class PPORolloutBuffer:
         padded_masks = []
         
         for cand, mask in zip(self.candidate_states, self.masks):
-            nA = cand.shape[0]
-            if nA < max_actions:
-                pad_size = max_actions - nA
+            if cand.shape[0] < max_actions:
+                pad_size = max_actions - cand.shape[0]
                 cand_padded = np.pad(cand, ((0, pad_size), (0, 0)), mode='constant')
                 mask_padded = np.pad(mask, (0, pad_size), mode='constant')
             else:
                 cand_padded = cand[:max_actions]
                 mask_padded = mask[:max_actions]
+            
             padded_cands.append(cand_padded)
             padded_masks.append(mask_padded)
         
-        return (
-            torch.as_tensor(np.array(self.states), dtype=torch.float32, device=device),
-            torch.as_tensor(np.array(padded_cands), dtype=torch.float32, device=device),
-            torch.as_tensor(np.array(padded_masks), dtype=torch.float32, device=device),
-            torch.as_tensor(self.actions, dtype=torch.long, device=device),
-            torch.as_tensor(self.log_probs, dtype=torch.float32, device=device),
-            torch.as_tensor(self.values, dtype=torch.float32, device=device),
-            torch.as_tensor(self.rewards, dtype=torch.float32, device=device),
-            torch.as_tensor(self.dones, dtype=torch.bool, device=device),
-        )
-
-# ------------- Actor-Critic Network with Move Scoring -------------
-
-class ResBlock(nn.Module):
-    """Residual block with pre-activation and LayerNorm."""
-    def __init__(self, d):
-        super().__init__()
-        self.norm = nn.LayerNorm(d)
-        self.fc1 = nn.Linear(d, 4 * d)
-        self.fc2 = nn.Linear(4 * d, d)
-    
-    def forward(self, x):
-        h = self.fc2(F.silu(self.fc1(self.norm(x))))
-        return x + h
+        # Convert to tensors
+        states = torch.as_tensor(np.array(self.states), dtype=torch.float32, device=device)
+        cand_states = torch.as_tensor(np.array(padded_cands), dtype=torch.float32, device=device)
+        masks = torch.as_tensor(np.array(padded_masks), dtype=torch.float32, device=device)
+        actions = torch.as_tensor(np.array(self.actions), dtype=torch.long, device=device)
+        old_log_probs = torch.as_tensor(np.array(self.log_probs), dtype=torch.float32, device=device)
+        values = torch.as_tensor(np.array(self.values), dtype=torch.float32, device=device)
+        rewards = torch.as_tensor(np.array(self.rewards), dtype=torch.float32, device=device)
+        dones = torch.as_tensor(np.array(self.dones), dtype=torch.float32, device=device)
+        
+        return states, cand_states, masks, actions, old_log_probs, values, rewards, dones
 
 
-class ResMLP(nn.Module):
-    """Residual MLP with SiLU activation and LayerNorm."""
-    def __init__(self, in_dim, d=512, n=6):
-        super().__init__()
-        self.inp = nn.Linear(in_dim, d)
-        self.blocks = nn.Sequential(*[ResBlock(d) for _ in range(n)])
-        self.norm = nn.LayerNorm(d)
-    
-    def forward(self, x):
-        x = F.silu(self.inp(x))
-        x = self.blocks(x)
-        return self.norm(x)
-
-
-class ActorCriticNet(nn.Module):
+# ------------- Actor-Critic Network -------------
+class ACNet(nn.Module):
     """
-    Network with ResMLP backbone and delta-based move scoring.
-    
-    Uses φ(s) for state encoding and ψ(Δ) for move deltas,
-    scoring moves via dot product: logit = φ(s) · ψ(Δ)
+    Delta-based Actor-Critic with ResMLP architecture.
+    Given current state s and Δ = s' - s, outputs Q(s, a).
     """
-    def __init__(self, in_dim=29, d=512, n_blocks=6):
+    def __init__(self, state_dim=30, model_dim=512, n_blocks=6):
         super().__init__()
+        self.state_dim = state_dim
+        self.model_dim = model_dim
         
-        # Shared ResMLP backbone for state encoding
-        self.shared = ResMLP(in_dim, d=d, n=n_blocks)
-        
-        # Value head (scores current state)
-        self.value_trunk = nn.Sequential(
-            ResBlock(d),
-            ResBlock(d),
+        # Separate encoders for state and delta
+        # Note: Using simpler normalization for MPS stability
+        self.state_encoder = nn.Sequential(
+            nn.Linear(state_dim, model_dim),
+            nn.ReLU()
         )
-        self.value = nn.Linear(d, 1)
         
-        # Policy: state encoder φ(s)
-        self.policy_trunk = nn.Sequential(
-            ResBlock(d),
-            ResBlock(d),
-        )
-        self.state_proj = nn.Linear(d, d)
-        
-        # Policy: move delta encoder ψ(Δ)
-        # Encodes the change (s' - s) rather than full s'
         self.delta_encoder = nn.Sequential(
-            nn.Linear(in_dim, d),
-            nn.SiLU(),
-            nn.LayerNorm(d),
-            nn.Linear(d, d),
+            nn.Linear(state_dim, model_dim),
+            nn.ReLU()
         )
         
-        self._initialize_weights()
-    
-    def _initialize_weights(self):
-        """Initialize with orthogonal weights and small gain."""
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                # Use smaller gain for stability with deeper networks
-                if m.out_features == 1:  # Output heads
-                    nn.init.orthogonal_(m.weight, gain=0.01)
-                else:
-                    nn.init.orthogonal_(m.weight, gain=1.0)
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
-    
-    def encode_state(self, x):
-        """Encode state(s) through shared backbone."""
-        return self.shared(x)
-    
-    def value_head(self, x):
-        """Compute value for state(s)."""
-        features = self.encode_state(x)
-        h = self.value_trunk(features)
-        return self.value(h).squeeze(-1)
-    
-    def score_moves_delta(self, state, deltas, mask=None):
-        """
-        Score moves using delta representation.
+        # ResMLP blocks (without LayerNorm for MPS stability)
+        self.blocks = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(model_dim, model_dim),
+                nn.ReLU(),
+                nn.Linear(model_dim, model_dim),
+            )
+            for _ in range(n_blocks)
+        ])
         
+        # Action scoring head
+        self.action_head = nn.Sequential(
+            nn.Linear(model_dim, model_dim // 2),
+            nn.ReLU(),
+            nn.Linear(model_dim // 2, 1)
+        )
+        
+        # Value head (operates on state encoding only)
+        self.value_head = nn.Sequential(
+            nn.Linear(model_dim, model_dim // 2),
+            nn.ReLU(),
+            nn.Linear(model_dim // 2, 1)
+        )
+        
+        # Initialize weights for numerical stability
+        self._init_weights()
+    
+    def value(self, states):
+        return self.value_head(self.state_encoder(states)).squeeze(-1)
+
+    def _init_weights(self):
+        """Initialize weights with small values for numerical stability."""
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                # Xavier/Glorot initialization with small gain for stability
+                nn.init.xavier_uniform_(module.weight, gain=0.5)
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0.0)
+    
+    def forward(self, states, deltas, mask):
+        """
         Args:
-            state: [B, state_dim] - current state
-            deltas: [B, A, state_dim] - move deltas (s' - s)
-            mask: [B, A] - 1 for valid, 0 for padding
+            states: [B, state_dim]
+            deltas: [B, nA, state_dim]
+            mask: [B, nA]
         
         Returns:
-            logits: [B, A] - scores for each move (masked)
+            logits: [B, nA]
+            values: [B]
         """
-        B, A, D = deltas.shape
+        B, nA, _ = deltas.shape
         
-        # Encode state once: φ(s)
-        state_features = self.encode_state(state)  # [B, d]
-        h_state = self.policy_trunk(state_features)  # [B, d]
-        z_state = self.state_proj(h_state)  # [B, d]
+        # Encode state once
+        state_emb = self.state_encoder(states)  # [B, model_dim]
         
-        # Encode all deltas: ψ(Δ) for each move
-        flat_deltas = deltas.view(B * A, D)  # [B*A, state_dim]
-        z_deltas = self.delta_encoder(flat_deltas)  # [B*A, d]
-        z_deltas = z_deltas.view(B, A, -1)  # [B, A, d]
+        # Encode all deltas
+        deltas_flat = deltas.view(B * nA, -1)  # [B*nA, state_dim]
+        delta_emb = self.delta_encoder(deltas_flat)  # [B*nA, model_dim]
+        delta_emb = delta_emb.view(B, nA, self.model_dim)  # [B, nA, model_dim]
         
-        # Score via dot product: φ(s) · ψ(Δ)
-        scores = (z_state.unsqueeze(1) * z_deltas).sum(-1)  # [B, A]
+        # Combine: broadcast state embedding to match deltas
+        state_emb_expanded = state_emb.unsqueeze(1).expand(B, nA, self.model_dim)  # [B, nA, model_dim]
+        combined = state_emb_expanded + delta_emb  # [B, nA, model_dim]
         
-        # Mask invalid actions
-        if mask is not None:
-            scores = scores + (mask == 0) * (-1e9)
+        # Apply ResMLP blocks
+        combined_flat = combined.view(B * nA, self.model_dim)  # [B*nA, model_dim]
+        for block in self.blocks:
+            residual = block(combined_flat)
+            combined_flat = combined_flat + residual
+        combined = combined_flat.view(B, nA, self.model_dim)  # [B, nA, model_dim]
         
-        return scores
+        # Score actions
+        logits = self.action_head(combined).squeeze(-1)  # [B, nA]
+        
+        # Apply mask (use large negative instead of -inf to avoid NaN in entropy)
+        logits = logits.masked_fill(mask == 0, -1e9)
+        
+        # Value from state encoding only
+        values = self.value_head(state_emb).squeeze(-1)  # [B]
+        
+        return logits, values
     
-    def score_moves(self, cand_states, mask=None):
-        """
-        Backward compatibility: score by re-encoding full states.
-        Kept for compatibility but delta version is preferred.
-        """
-        # For backward compatibility, but not used in delta-based training
-        raise NotImplementedError("Use score_moves_delta instead")
+    def score_moves_delta(self, states, deltas, mask):
+        """Score moves using delta representation (for action selection)."""
+        logits, _ = self.forward(states, deltas, mask)
+        return logits
 
-# ------------- PPO Agent Class -------------
+
+# ------------- PPO Agent -------------
 class PPOAgent:
     """
-    PPO agent with legal move masking.
-    Each instance has its own network, optimizer, and buffer.
+    PPO agent with instance-based design for independent training.
     """
     def __init__(self, config=None, device=None):
-        '''
-        Initialize PPO Agent.
+        self.config = config or CFG
         
-        Args:
-            config: Config instance (SmallConfig, MediumConfig, or LargeConfig)
-                    If None, uses default Config()
-            device: 'cuda' or 'cpu'. If None, auto-detects.
-        '''
-        # Use provided config or default
-        if config is None:
-            config = CFG
+        # Device handling: use provided device, otherwise auto-detect
+        if device is not None:
+            self.device = device
+        else:
+            self.device = get_device()
         
-        self.config = config
-        self.device = device if device else (config.device if hasattr(config, 'device') else CFG.device)
+        print(f"[PPOAgent] Initializing on device: {self.device}")
         
-        # Create network with config dimensions
-        self.acnet = ActorCriticNet(
-            in_dim=self.config.state_dim,
-            d=self.config.model_dim,        # ← Uses config
-            n_blocks=self.config.n_blocks   # ← Uses config
+        # Build network
+        self.acnet = ACNet(
+            state_dim=self.config.state_dim,
+            model_dim=self.config.model_dim,
+            n_blocks=self.config.n_blocks
         ).to(self.device)
-
-        decay, no_decay = [], []
-        for n, p in self.acnet.named_parameters():
-            if p.ndim == 1 or 'bias' in n or 'norm' in n.lower():
-                no_decay.append(p)
-            else:
-                decay.append(p)
-
-        self.optimizer = torch.optim.AdamW(
-            [
-                {'params': decay, 'weight_decay': self.config.weight_decay},
-                {'params': no_decay, 'weight_decay': 0.0},
-            ],
+        
+        self.optimizer = torch.optim.Adam(
+            self.acnet.parameters(),
             lr=self.config.lr,
-            eps=1e-5,
+            weight_decay=self.config.weight_decay
         )
         
-        self.buffer = PPORolloutBuffer(self.config.rollout_length)
-        
-        # State
-        self.eval_mode = False
+        # Training state
         self.steps = 0
         self.updates = 0
+        self.eval_mode = False
         self.current_entropy_coef = self.config.entropy_coef
         
-        # Tracking for logging
+        # Rollout buffer
+        self.buffer = PPORolloutBuffer(rollout_length=self.config.rollout_length)
+        
+        # Statistics
         self.rollout_stats = {
             'nA_values': [],
             'advantages': [],
             'masked_entropy': [],
-            'value_loss_std': []
+            'value_loss_std': [],
         }
+        
+        print(f"[PPOAgent] Network parameters: {sum(p.numel() for p in self.acnet.parameters()):,}")
     
     def set_eval_mode(self, is_eval: bool):
         """Set evaluation mode."""
-        self.eval_mode = bool(is_eval)
-        if self.eval_mode:
+        self.eval_mode = is_eval
+        if is_eval:
             self.acnet.eval()
         else:
             self.acnet.train()
     
-    def save(self, path: str):
-        """Save agent state."""
-        p = Path(path)
-        p.parent.mkdir(parents=True, exist_ok=True)
-        torch.save({
-            "acnet": self.acnet.state_dict(),
-            "optimizer": self.optimizer.state_dict(),
-            "steps": self.steps,
-            "updates": self.updates,
-            "entropy_coef": self.current_entropy_coef,
-        }, p)
+    def _encode_state(self, board, moves_left):
+        """Encode board state with move counter."""
+        state = np.concatenate([board, [moves_left / 4.0]])
+        return state.astype(np.float32)
     
-    def load(self, path: str, map_location=None):
-        """Load agent state with robust error handling."""
-        if map_location is None:
-            map_location = self.device
-        
-        # Load checkpoint with weights_only=False for backward compatibility
-        try:
-            checkpoint = torch.load(path, map_location=map_location, weights_only=False)
-        except TypeError:
-            # Older PyTorch versions don't have weights_only parameter
-            checkpoint = torch.load(path, map_location=map_location)
-        
-        # Load network weights
-        self.acnet.load_state_dict(checkpoint["acnet"])
-        
-        # Load optimizer state if present
-        if "optimizer" in checkpoint:
-            try:
-                self.optimizer.load_state_dict(checkpoint["optimizer"])
-            except Exception as e:
-                print(f"[Load] Warning: Could not load optimizer state: {e}")
-        
-        # Load training state
-        if "steps" in checkpoint:
-            self.steps = checkpoint["steps"]
-        if "updates" in checkpoint:
-            self.updates = checkpoint["updates"]
-        if "entropy_coef" in checkpoint:
-            self.current_entropy_coef = checkpoint["entropy_coef"]
-        
-        # Ensure network is on correct device
-        self.acnet.to(self.device)
-        
-        # Set to eval mode after loading
-        self.set_eval_mode(True)
-        
-        # Print confirmation
-        print(f"[Load] Checkpoint loaded: {path}")
-        print(f"  Device: {self.device}")
-        print(f"  Steps: {self.steps:,}, Updates: {self.updates:,}")
-        print(f"  Entropy coef: {self.current_entropy_coef:.4f}")
-
-    def can_load(self, path: str) -> bool:
-        """Check if checkpoint exists and is valid."""
-        p = Path(path)
-        if not p.exists():
-            return False
-        
-        try:
-            checkpoint = torch.load(p, map_location='cpu', weights_only=False)
-            return "acnet" in checkpoint
-        except Exception as e:
-            print(f"[Load] Cannot load {path}: {e}")
-            return False
-    
-    def _encode_state(self, board_flipped, moves_left):
-        """Encode board state."""
-        x = np.zeros(self.config.state_dim, dtype=np.float32)
-        x[:24] = np.clip(board_flipped[1:25] * 0.2, -1, 1)
-        x[24] = np.clip(board_flipped[25] * 0.2, -1, 1)
-        x[25] = np.clip(board_flipped[26] * 0.2, -1, 1)
-        x[26] = board_flipped[27] / 15.0
-        x[27] = board_flipped[28] / 15.0
-        x[28] = float(moves_left)
-        return x
-    
-    def _compute_shaped_reward(self, prev_board, new_board):
-        """Compute reward shaping based on progress."""
+    def _compute_shaped_reward(self, old_board, new_board):
+        """Compute auxiliary reward shaping (SMALL values only!)."""
         if not self.config.use_reward_shaping:
             return 0.0
         
         reward = 0.0
         
-        # Progress in bearing off
-        prev_borne = prev_board[27]
-        new_borne = new_board[27]
-        if new_borne > prev_borne:
-            reward += self.config.bear_off_reward * (new_borne - prev_borne)
-        
         # Pip count improvement (normalized)
-        def pip_count(board):
-            total = 0
-            for i in range(1, 25):
-                if board[i] > 0:
-                    total += i * board[i]
-            return total
+        old_pip = np.sum(np.arange(29) * np.maximum(old_board, 0))
+        new_pip = np.sum(np.arange(29) * np.maximum(new_board, 0))
+        pip_improvement = (old_pip - new_pip) / 167.0  # 167 = max pip count
+        reward += self.config.pip_reward_scale * pip_improvement
         
-        prev_pip = pip_count(prev_board)
-        new_pip = pip_count(new_board)
-        pip_delta = (prev_pip - new_pip) / 100.0  # Normalize
-        reward += self.config.pip_reward_scale * pip_delta
+        # Bear-off progress
+        old_borne = old_board[27]
+        new_borne = new_board[27]
+        if new_borne > old_borne:
+            reward += self.config.bear_off_reward * (new_borne - old_borne)
         
-        # Clip to prevent rare spikes
+        # Clip total shaping
         reward = np.clip(reward, -self.config.shaping_clip, self.config.shaping_clip)
         
         return reward
     
-    def _compute_gae(self, rewards, values, dones, last_value):
+    def save(self, path: str):
+        """Save agent checkpoint."""
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        
+        checkpoint = {
+            "acnet": self.acnet.state_dict(),
+            "optimizer": self.optimizer.state_dict(),
+            "steps": self.steps,
+            "updates": self.updates,
+            "current_entropy_coef": self.current_entropy_coef,
+            "config": {
+                "state_dim": self.config.state_dim,
+                "max_actions": self.config.max_actions,
+                "model_dim": self.config.model_dim,
+                "n_blocks": self.config.n_blocks,
+                "lr": self.config.lr,
+                "gamma": self.config.gamma,
+                "gae_lambda": self.config.gae_lambda,
+            }
+        }
+        
+        torch.save(checkpoint, path)
+    
+    def load(self, path: str, map_location: Union[str, torch.device] = None):
+        """Load agent checkpoint with proper device handling."""
+        if map_location is None:
+            map_location = self.device
+        
+        checkpoint = torch.load(path, map_location=map_location, weights_only=False)
+        
+        self.acnet.load_state_dict(checkpoint["acnet"])
+        self.optimizer.load_state_dict(checkpoint["optimizer"])
+        self.steps = checkpoint.get("steps", 0)
+        self.updates = checkpoint.get("updates", 0)
+        self.current_entropy_coef = checkpoint.get("current_entropy_coef", self.config.entropy_coef)
+        
+        print(f"[PPOAgent] Loaded checkpoint from {path}")
+        print(f"  Steps: {self.steps}, Updates: {self.updates}")
+    
+    def _compute_gae(self, rewards, values, dones):
         """Compute Generalized Advantage Estimation."""
         advantages = []
         gae = 0
         
-        # Ensure last_value is a tensor on the right device
-        if not isinstance(last_value, torch.Tensor):
-            last_value = torch.tensor(last_value, dtype=torch.float32, device=self.device)
-        
-        # Ensure all tensors are on the right device
-        values = values.to(self.device)
-        rewards = rewards.to(self.device)
-        dones = dones.to(self.device)
-        
         for t in reversed(range(len(rewards))):
             if t == len(rewards) - 1:
-                next_value = last_value
+                next_value = 0
             else:
                 next_value = values[t + 1]
             
-            delta = rewards[t] + self.config.gamma * next_value * (1 - dones[t].float()) - values[t]
-            gae = delta + self.config.gamma * self.config.gae_lambda * (1 - dones[t].float()) * gae
+            delta = rewards[t] + self.config.gamma * next_value * (1 - dones[t]) - values[t]
+            gae = delta + self.config.gamma * self.config.gae_lambda * (1 - dones[t]) * gae
             advantages.insert(0, gae)
         
-        advantages = torch.stack(advantages)
-        returns = advantages + values
+        advantages = torch.tensor(advantages, dtype=torch.float32, device=self.device)
+        values_tensor = torch.tensor(values, dtype=torch.float32, device=self.device)
+        returns = advantages + values_tensor
         
         return advantages, returns
     
     def _ppo_update(self):
         """Perform PPO update on collected rollout."""
-        if self.eval_mode or not self.buffer.is_ready():
+        if not self.buffer.is_ready():
             return
         
         # Get rollout data
         states, cand_states, masks, actions, old_log_probs, values, rewards, dones = \
             self.buffer.get(self.config.max_actions, self.device)
         
-        # Compute deltas: Δ = s' - s for each candidate
-        # states: [B, state_dim], cand_states: [B, A, state_dim]
-        deltas = cand_states - states.unsqueeze(1)  # [B, A, state_dim]
-        
-        # Compute last value for GAE
-        with torch.no_grad():
-            last_value = self.acnet.value_head(states[-1:])
-            if last_value.dim() > 0:
-                last_value = last_value.item()
-        
         # Compute advantages and returns
-        advantages, returns = self._compute_gae(rewards, values, dones, last_value)
+        advantages, returns = self._compute_gae(
+            rewards.cpu().numpy(),
+            values.cpu().numpy(),
+            dones.cpu().numpy()
+        )
         
         # Normalize advantages
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
         
-        # Track statistics
-        rollout_nA = (masks.sum(dim=1)).cpu().numpy()
-        self.rollout_stats['nA_values'].extend(rollout_nA.tolist())
+        # Store statistics
+        nA_per_step = masks.sum(dim=1).cpu().numpy()
+        self.rollout_stats['nA_values'].extend(nA_per_step.tolist())
         self.rollout_stats['advantages'].extend(advantages.cpu().numpy().tolist())
         
         # PPO epochs
-        total_samples = len(states)
-        indices = np.arange(total_samples)
-        
-        epoch_value_losses = []
         epoch_policy_losses = []
+        epoch_value_losses = []
         epoch_entropies = []
         
         for epoch in range(self.config.ppo_epochs):
-            np.random.shuffle(indices)
+            # Mini-batch training
+            indices = torch.randperm(len(states), device=self.device)
             
-            for start in range(0, total_samples, self.config.minibatch_size):
+            for start in range(0, len(states), self.config.minibatch_size):
                 end = start + self.config.minibatch_size
-                mb_indices = indices[start:end]
+                batch_indices = indices[start:end]
                 
-                mb_states = states[mb_indices]
-                mb_deltas = deltas[mb_indices]
-                mb_masks = masks[mb_indices]
-                mb_actions = actions[mb_indices]
-                mb_old_log_probs = old_log_probs[mb_indices]
-                mb_advantages = advantages[mb_indices]
-                mb_returns = returns[mb_indices]
+                # Get batch
+                b_states = states[batch_indices]
+                b_cand_states = cand_states[batch_indices]
+                b_masks = masks[batch_indices]
+                b_actions = actions[batch_indices]
+                b_old_log_probs = old_log_probs[batch_indices]
+                b_advantages = advantages[batch_indices]
+                b_returns = returns[batch_indices]
                 
-                # Forward pass - use delta-based scoring
-                logits = self.acnet.score_moves_delta(mb_states, mb_deltas, mb_masks)
-                log_probs = F.log_softmax(logits, dim=1)
+                # Compute deltas
+                b_deltas = b_cand_states - b_states.unsqueeze(1)
                 
-                # Get log prob of taken actions
-                new_log_probs = log_probs.gather(1, mb_actions.unsqueeze(1)).squeeze(1)
+                # Forward pass
+                logits, new_values = self.acnet(b_states, b_deltas, b_masks)
                 
-                # PPO clipped objective
-                ratio = torch.exp(new_log_probs - mb_old_log_probs)
-                clipped_ratio = torch.clamp(ratio, 1 - self.config.clip_epsilon, 1 + self.config.clip_epsilon)
+                # Mask logits with large negative value instead of -inf to avoid NaN
+                logits_masked = logits.masked_fill(b_masks == 0, -1e9)
                 
-                policy_loss = -torch.min(
-                    ratio * mb_advantages,
-                    clipped_ratio * mb_advantages
-                ).mean()
-                epoch_policy_losses.append(policy_loss.item())
+                # Compute probabilities
+                probs = F.softmax(logits_masked, dim=-1)
+                dist_probs = probs.gather(1, b_actions.unsqueeze(1)).squeeze(1)
+                new_log_probs = torch.log(dist_probs + 1e-9)
+                
+                # PPO clipped loss
+                ratio = torch.exp(new_log_probs - b_old_log_probs)
+                surr1 = ratio * b_advantages
+                surr2 = torch.clamp(ratio, 1 - self.config.clip_epsilon, 1 + self.config.clip_epsilon) * b_advantages
+                policy_loss = -torch.min(surr1, surr2).mean()
                 
                 # Value loss
-                new_values = self.acnet.value_head(mb_states)
-                value_loss = F.mse_loss(new_values, mb_returns)
-                epoch_value_losses.append(value_loss.item())
+                value_loss = F.mse_loss(new_values, b_returns)
                 
-                # Entropy bonus (computed directly from masked logits with safety)
-                probs = F.softmax(logits, dim=1)
-                safe_mask = (mb_masks > 0).float()
-                entropy_vec = -(probs * log_probs * safe_mask).sum(dim=1)
-                entropy = torch.nan_to_num(entropy_vec, nan=0.0, posinf=0.0, neginf=0.0).mean()
-                epoch_entropies.append(entropy.item())
+                # Entropy bonus (use finite log to avoid NaN)
+                log_probs_finite = torch.log(probs + 1e-12)  # Strictly finite
+                entropy = -(probs * log_probs_finite).sum(dim=-1).mean()
                 
                 # Total loss
                 loss = policy_loss + self.config.critic_coef * value_loss - self.current_entropy_coef * entropy
                 
+                # Check for non-finite loss before backward
+                if not torch.isfinite(loss):
+                    print(f"[ERROR] Non-finite loss: {loss.item()}, skipping step")
+                    self.optimizer.zero_grad(set_to_none=True)
+                    continue
+                
+                # Store for logging
+                epoch_policy_losses.append(policy_loss.item())
+                epoch_value_losses.append(value_loss.item())
+                epoch_entropies.append(entropy.item())
+                
                 # Optimize
                 self.optimizer.zero_grad()
                 loss.backward()
+                
+                # Check for NaN in gradients
+                has_nan_grad = False
+                for name, param in self.acnet.named_parameters():
+                    if param.grad is not None and torch.isnan(param.grad).any():
+                        print(f"[ERROR] NaN gradient in {name}")
+                        has_nan_grad = True
+                
+                if has_nan_grad:
+                    print(f"[ERROR] Skipping optimizer step due to NaN gradients")
+                    continue
+                
                 grad_norm = nn.utils.clip_grad_norm_(self.acnet.parameters(), self.config.max_grad_norm).item()
+                
+                # Check if grad norm is reasonable
+                if not np.isfinite(grad_norm):
+                    print(f"[ERROR] Non-finite grad norm: {grad_norm}")
+                    continue
+                    
                 self.optimizer.step()
         
         self.updates += 1
@@ -717,6 +679,40 @@ class PPOAgent:
         if nA == 0:
             return []
         
+        # Special case: only one legal move
+        if nA == 1:
+            chosen_move = possible_moves[0]
+            chosen_board = possible_boards[0]
+            
+            # Reward
+            terminal_reward = 1.0 if (chosen_board[27] == 15) else 0.0
+            shaped_reward = self._compute_shaped_reward(board_pov, chosen_board) if train else 0.0
+            total_reward = terminal_reward + shaped_reward
+            done = bool(terminal_reward > 0.0)
+            
+            # Store in rollout buffer if training
+            if train and not self.eval_mode:
+                moves_left = 1 + int(dice[0] == dice[1]) - i
+                S = self._encode_state(board_pov, moves_left)
+                cand_states = np.array([self._encode_state(chosen_board, moves_left - 1)])
+                mask = np.ones(1, dtype=np.float32)
+                
+                # Pad to max_actions
+                pad_size = self.config.max_actions - 1
+                cand_padded = np.pad(cand_states, ((0, pad_size), (0, 0)), mode='constant')
+                mask_padded = np.pad(mask, (0, pad_size), mode='constant')
+                
+                self.buffer.push(S, cand_padded, mask_padded, 0, 0.0, 0.0, total_reward, done)
+                self.steps += 1
+                if self.buffer.is_ready():
+                    self._ppo_update()
+            
+            # Flip move back if needed
+            if player == -1:
+                chosen_move = _flip_move(chosen_move)
+            
+            return chosen_move
+        
         moves_left = 1 + int(dice[0] == dice[1]) - i
         
         # Encode current state
@@ -747,9 +743,10 @@ class PPOAgent:
         mask_t = torch.as_tensor(mask[None, :], dtype=torch.float32, device=self.device)
         
         with torch.no_grad():
-            # Use delta-based scoring
-            logits = self.acnet.score_moves_delta(S_t, deltas_t, mask_t).squeeze(0)
-            value = self.acnet.value_head(S_t).item()
+            # Use delta-based scoring and get value from forward pass
+            logits, value_t = self.acnet(S_t, deltas_t, mask_t)
+            logits = logits.squeeze(0)
+            value = value_t.item()
         
         # Action selection
         # NO temperature during training - use plain softmax
@@ -757,6 +754,13 @@ class PPOAgent:
         if train and not self.eval_mode:
             # Training: plain softmax (exploration via entropy bonus)
             probs = F.softmax(logits, dim=0)
+            
+            # Safety check: if all probs are nan/inf, use uniform distribution
+            if torch.isnan(probs).any() or torch.isinf(probs).any() or (probs < 0).any():
+                print(f"[WARNING] Invalid probabilities detected. Logits: {logits}")
+                print(f"  nA={nA}, mask={mask}")
+                probs = torch.ones(nA, device=self.device) / nA
+            
             a_idx = torch.multinomial(probs, 1).item()
             log_prob = torch.log(probs[a_idx] + 1e-9).item()
         else:
@@ -815,7 +819,7 @@ def _get_agent():
     """Get or create the default agent instance."""
     global _default_agent
     if _default_agent is None:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        device = get_device()
         _default_agent = PPOAgent(config=CFG, device=device)
         print(f"PPO agent initialized")
         print(f"  Device: {device}")

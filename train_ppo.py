@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-CPU-Optimized PPO Training Script
+PPO Training Script with MPS Support
 
 NEW: Support for small/medium/large model sizes
 - Small: ~80K params, 5-10x faster, great for CPU testing
-- Medium: ~400K params, 2-3x faster, good for T4 GPU
+- Medium: ~400K params, 2-3x faster, good for T4 GPU or M1/M2 Mac
 - Large: ~1.6M params, best performance, needs good GPU
 
-All fixes from previous versions included.
+Device support: CUDA > MPS > CPU (auto-detected)
 """
 
 import numpy as np
@@ -36,9 +36,8 @@ torch.manual_seed(42)
 if torch.cuda.is_available():
     torch.cuda.manual_seed_all(42)
 
-# Google Drive paths
-GDRIVE_ROOT = "/content/drive/MyDrive/Backgammon" if os.path.exists("/content/drive") else "."
-CHECKPOINT_DIR = os.path.join(GDRIVE_ROOT, "checkpoints")
+# Local checkpoint directory (no Google Drive)
+CHECKPOINT_DIR = "./checkpoints"
 
 # --- Checkpoint helpers ---
 def _ensure_dir(path: Path) -> bool:
@@ -141,8 +140,9 @@ def select_move_with_lookahead(agent_obj, board_pov, dice, i, k=3):
             resulting_board = possible_boards[idx]
             result_state = agent_obj._encode_state(resulting_board, moves_left - 1)
             result_state_t = torch.as_tensor(result_state[None, :], dtype=torch.float32, device=agent_obj.device)
-            value = agent_obj.acnet.value_head(result_state_t).item()
-            
+            with torch.no_grad():
+                value = agent_obj.acnet.value(result_state_t).item()
+ 
             if value > best_value:
                 best_value = value
                 best_idx = idx
@@ -210,196 +210,146 @@ def evaluate(agent_mod, evaluation_agent, n_eval, label="", debug_sides=False,
     rolling_window = []
     window_size = 20
     
-    lookahead_str = f" (k={lookahead_k} lookahead)" if use_lookahead else ""
-    eval_bar = tqdm(range(n_eval), desc=f"Evaluating {label}{lookahead_str}", leave=False, ncols=120)
-    
-    for i in eval_bar:
-        if i % 2 == 0:
-            w, _ = play_one_game(agent_mod, evaluation_agent, training=False, 
-                                commentary=False, use_lookahead=use_lookahead, 
-                                lookahead_k=lookahead_k)
-            games_as_p1 += 1
-            if w == 1:
-                wins += 1
-                wins_as_p1 += 1
-        else:
-            w, _ = play_one_game(evaluation_agent, agent_mod, training=False, 
-                                commentary=False, use_lookahead=use_lookahead,
-                                lookahead_k=lookahead_k)
-            w = -w
-            games_as_p2 += 1
-            if w == 1:
-                wins += 1
-                wins_as_p2 += 1
+    for g in range(n_eval):
+        # Agent 1 plays as player 1
+        winner, _ = play_one_game(agent_mod, evaluation_agent, training=False, 
+                                  use_lookahead=use_lookahead, lookahead_k=lookahead_k)
+        if winner == 1:
+            wins += 1
+            wins_as_p1 += 1
+        games_as_p1 += 1
         
-        rolling_window.append(1 if w == 1 else 0)
+        # Agent 1 plays as player -1
+        winner, _ = play_one_game(evaluation_agent, agent_mod, training=False,
+                                  use_lookahead=use_lookahead, lookahead_k=lookahead_k)
+        if winner == -1:
+            wins += 1
+            wins_as_p2 += 1
+        games_as_p2 += 1
+        
+        rolling_window.append(winner == -1)
         if len(rolling_window) > window_size:
             rolling_window.pop(0)
-        
-        current_wr = round(wins / (i + 1) * 100.0, 1)
-        rolling_wr = round(100.0 * sum(rolling_window) / len(rolling_window), 1) if rolling_window else 0.0
-        
-        eval_bar.set_postfix({"WR": f"{current_wr}%", f"Roll{window_size}": f"{rolling_wr}%"})
     
-    winrate = round(wins / n_eval * 100.0, 3)
+    wr = 100.0 * wins / (n_eval * 2)
+    p1_wr = 100.0 * wins_as_p1 / games_as_p1 if games_as_p1 > 0 else 0
+    p2_wr = 100.0 * wins_as_p2 / games_as_p2 if games_as_p2 > 0 else 0
     
-    print(f"[Eval] {label}{lookahead_str}: win-rate = {winrate}% over {n_eval} games")
+    lookahead_str = f" (k={lookahead_k} lookahead)" if use_lookahead else ""
+    print(f"{label}{lookahead_str}: {wr:.1f}%", end="")
     
     if debug_sides:
-        wr_as_p1 = round(100.0 * wins_as_p1 / games_as_p1, 1) if games_as_p1 > 0 else 0.0
-        wr_as_p2 = round(100.0 * wins_as_p2 / games_as_p2, 1) if games_as_p2 > 0 else 0.0
-        print(f"  Side split: as P1: {wr_as_p1}% ({wins_as_p1}/{games_as_p1}), "
-              f"as P2: {wr_as_p2}% ({wins_as_p2}/{games_as_p2})")
-        
-        if abs(wr_as_p1 - wr_as_p2) > 20.0:
-            print(f"  ⚠️  WARNING: Large side discrepancy!")
+        print(f"  [P1: {p1_wr:.1f}% | P2: {p2_wr:.1f}%]", end="")
     
-    return winrate
+    print()
+    return wr
 
 
 class CheckpointLeague:
-    """Manages historical checkpoints for self-play evaluation."""
-    def __init__(self, checkpoint_dir=CHECKPOINT_DIR, league_size=5):
+    """Manage league of historical checkpoints for evaluation."""
+    def __init__(self, checkpoint_dir: Path, agent_module_name: str = "ppo_agent"):
         self.checkpoint_dir = Path(checkpoint_dir)
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        self.league_dir = self.checkpoint_dir / "league"
-        self.league_dir.mkdir(exist_ok=True)
+        self.agent_module_name = agent_module_name
+        self.checkpoints = {}
         
-        self.league_size = league_size
-        self.checkpoints = []
-        
-        self._load_existing_checkpoints()
-        
-        print(f"Checkpoint League initialized")
-        print(f"  Directory: {self.league_dir}")
-        print(f"  League size: {league_size}")
-        print(f"  Existing checkpoints: {len(self.checkpoints)}")
+        print(f"[League] Initialized at {self.checkpoint_dir}")
     
-    def _load_existing_checkpoints(self):
-        if not self.league_dir.exists():
-            return
-        
-        for checkpoint_file in sorted(self.league_dir.glob("checkpoint_g*.pt")):
-            try:
-                game_num = int(checkpoint_file.stem.split('_g')[1])
-                self.checkpoints.append((game_num, checkpoint_file))
-            except (ValueError, IndexError):
-                print(f"Warning: Could not parse checkpoint {checkpoint_file.name}")
-        
-        if len(self.checkpoints) > self.league_size:
-            self.checkpoints = sorted(self.checkpoints, key=lambda x: x[0])[-self.league_size:]
+    def add_checkpoint(self, game_count: int, checkpoint_path: str):
+        """Add checkpoint to league."""
+        league_path = self.checkpoint_dir / f"league_{game_count}.pt"
+        shutil.copy(checkpoint_path, league_path)
+        self.checkpoints[game_count] = league_path
+        print(f"[League] Added checkpoint at {game_count:,} games")
     
-    def add_checkpoint(self, game_num, source_path):
-        checkpoint_name = f"checkpoint_g{game_num}.pt"
-        checkpoint_path = self.league_dir / checkpoint_name
-        
-        shutil.copy(source_path, checkpoint_path)
-        self.checkpoints.append((game_num, checkpoint_path))
-        
-        if len(self.checkpoints) > self.league_size:
-            old_game_num, old_path = self.checkpoints.pop(0)
-            try:
-                old_path.unlink()
-                print(f"Removed old checkpoint from league: g{old_game_num}")
-            except Exception as e:
-                print(f"Could not remove old checkpoint: {e}")
-        
-        print(f"Added checkpoint g{game_num} to league (size: {len(self.checkpoints)}/{self.league_size})")
-    
-    def evaluate_against_league(self, current_agent, n_eval_per_opponent=100):
+    def evaluate_against_league(self, current_agent, n_eval_per_opponent: int = 50):
+        """Evaluate current agent against all league members."""
         if not self.checkpoints:
-            print("League is empty, skipping evaluation")
+            print("[League] No checkpoints to evaluate against")
             return {}
         
-        print(f"\nEvaluating against {len(self.checkpoints)} league opponents:")
         results = {}
+        agent_mod = __import__(self.agent_module_name)
         
-        for game_num, checkpoint_path in self.checkpoints:
-            print(f"\n  vs checkpoint g{game_num}...")
-            
+        print(f"\n[League] Evaluating against {len(self.checkpoints)} checkpoints")
+        print("-" * 60)
+        
+        for game_count in sorted(self.checkpoints.keys()):
             try:
-                opponent = agent.PPOAgent()
-                opponent.load(str(checkpoint_path), map_location=opponent.device)
+                checkpoint_path = self.checkpoints[game_count]
+                
+                opponent = agent_mod.PPOAgent()
+                opponent.load(str(checkpoint_path))
                 opponent.set_eval_mode(True)
                 
-                wr = evaluate(
-                    current_agent, 
-                    opponent, 
-                    n_eval_per_opponent,
-                    label=f"vs league g{game_num}",
-                    debug_sides=True
-                )
-                results[game_num] = wr
+                wr = evaluate(current_agent, opponent, n_eval_per_opponent,
+                            label=f"  vs {game_count:,}g checkpoint", debug_sides=False)
+                results[game_count] = wr
                 
             except Exception as e:
-                print(f"  Error evaluating vs g{game_num}: {e}")
-                results[game_num] = None
+                print(f"  Error evaluating vs {game_count:,}g: {e}")
+                results[game_count] = None
         
+        print("-" * 60)
         return results
 
 
-def train(
-    n_games=200_000,
-    n_epochs=5_000,
-    n_eval=200,
-    eval_vs="pubeval",
-    league_checkpoint_every=25_000,
-    league_size=5,
-    n_eval_league=100,
-    use_gdrive=True,
-    # NEW: Model size selection
-    model_size='large',  # 'small', 'medium', or 'large'
-    # Opponent pool config
-    use_opponent_pool=True,
-    pool_snapshot_every=5_000,
-    pool_max_size=12,
-    pool_sample_rate=0.45,
-    pubeval_sample_rate=0.30,
-    random_sample_rate=0.25,
-    # Evaluation enhancements
-    use_eval_lookahead=True,
-    eval_lookahead_k=3,
-):
+def train(n_games=200_000, 
+          n_epochs=5_000,
+          n_eval=200,
+          eval_vs="pubeval",
+          model_size='large',
+          use_opponent_pool=True,
+          pool_snapshot_every=5_000,
+          pool_max_size=12,
+          pool_sample_rate=0.45,
+          pubeval_sample_rate=0.30,
+          random_sample_rate=0.25,
+          use_eval_lookahead=True,
+          eval_lookahead_k=3,
+          league_checkpoint_every=20_000,
+          n_eval_league=50):
     """
-    PPO training with configurable model size.
+    Main training loop with opponent pool and league evaluation.
     
-    NEW FEATURE: model_size parameter
-    - 'small': ~80K params, 5-10x faster, for CPU
-    - 'medium': ~400K params, 2-3x faster, for T4 GPU
-    - 'large': ~1.6M params, best performance, for good GPUs
+    Args:
+        n_games: Total number of training games
+        n_epochs: Evaluate every N games
+        n_eval: Number of evaluation games
+        eval_vs: Baseline opponent ('pubeval' or 'random')
+        model_size: Model size ('small', 'medium', 'large')
+        use_opponent_pool: Whether to use opponent pool
+        pool_snapshot_every: Add snapshot to pool every N games
+        pool_max_size: Maximum pool size
+        pool_sample_rate: Probability of sampling from pool
+        pubeval_sample_rate: Probability of sampling pubeval
+        random_sample_rate: Probability of sampling random
+        use_eval_lookahead: Use lookahead during evaluation
+        eval_lookahead_k: Lookahead depth for evaluation
+        league_checkpoint_every: Add to league every N games
+        n_eval_league: Games per league opponent
     """
-    
-    baseline = pubeval if eval_vs == "pubeval" else randomAgent
-    
-    checkpoint_base_path = Path(CHECKPOINT_DIR) if use_gdrive else Path("./checkpoints")
-    checkpoint_base_path.mkdir(parents=True, exist_ok=True)
-    
-    if not _ensure_dir(checkpoint_base_path):
-        print(f"[WARNING] Could not verify write access to {checkpoint_base_path}")
-    
-    # NEW: Create agent with specified model size
-    print()
+    print("\n" + "=" * 70)
+    print("PPO TRAINING")
     print("=" * 70)
-    print("CREATING AGENT")
-    print("=" * 70)
+    print(f"Model size: {model_size.upper()}")
+    print(f"Total games: {n_games:,}")
+    print(f"Evaluate every: {n_epochs:,} games")
+    print(f"Evaluation games: {n_eval}")
+    print(f"Baseline: {eval_vs}")
+    print(f"Lookahead: {use_eval_lookahead} (k={eval_lookahead_k})")
+    print(f"Device: {agent.get_device()}")
+    print("=" * 70 + "\n")
     
-    # Get config for specified size
-    if hasattr(agent, 'get_config'):
-        cfg = agent.get_config(model_size)
-        agent_instance = agent.PPOAgent(config=cfg)
-        # Update module-level agent
-        agent._default_agent = agent_instance
-    else:
-        print(f"WARNING: get_config() not found in ppo_agent.")
-        print(f"Using default config. To enable model size selection,")
-        print(f"add the config classes from model_size_configs.py to ppo_agent.py")
-        agent_instance = agent._get_agent()
+    # Initialize agent with specified model size
+    cfg = agent.get_config(model_size)
+    device = agent.get_device()
+    agent_instance = agent.PPOAgent(config=cfg, device=device)
     
-    # Set checkpoint path
+    # Set checkpoint path based on model size
+    checkpoint_base_path = Path(CHECKPOINT_DIR)
+    _ensure_dir(checkpoint_base_path)
     agent.CHECKPOINT_PATH = checkpoint_base_path / f"best_ppo_{model_size}.pt"
-    
-    print("=" * 70)
-    print()
     
     # Initialize opponent pool
     opponent_pool = None
@@ -411,92 +361,98 @@ def train(
             max_size=pool_max_size,
             seed=42
         )
+        print(f"\nOpponent Pool Configuration:")
+        print(f"  Snapshot every: {pool_snapshot_every:,} games")
+        print(f"  Max size: {pool_max_size}")
+        print(f"  Sample rates: Pool={pool_sample_rate:.0%}, Pubeval={pubeval_sample_rate:.0%}, Random={random_sample_rate:.0%}")
+        print()
     
-    league = CheckpointLeague(checkpoint_dir=checkpoint_base_path, league_size=league_size)
+    # Initialize checkpoint league
+    league = CheckpointLeague(
+        checkpoint_dir=checkpoint_base_path / f"league_{model_size}",
+        agent_module_name="ppo_agent"
+    )
     
+    # Baseline opponent
+    if eval_vs == "pubeval":
+        baseline = pubeval
+    else:
+        baseline = randomAgent
+    
+    # Performance tracking
     perf_data = {
         'vs_baseline': [],
         'vs_baseline_lookahead': [],
         'vs_random': [],
         'vs_league_avg': [],
-        'vs_latest_checkpoint': [],
+        'vs_latest_checkpoint': []
     }
-    best_wr = -1
     
+    best_wr = 0.0
+    
+    # Opponent statistics
     opponent_stats = {
+        'self_play': 0,
         'pool': 0,
         'pubeval': 0,
-        'random': 0,
-        'self': 0,
+        'random': 0
     }
     
-    print()
-    print("=" * 70)
-    print("TRAINING CONFIGURATION")
-    print("=" * 70)
-    print(f"Model size: {model_size.upper()}")
-    print(f"Total games: {n_games:,}")
-    print(f"Evaluation every: {n_epochs:,} games")
-    print(f"Baseline: {eval_vs}")
-    print()
-    print("OPPONENT CURRICULUM:")
-    print(f"  Pool: {pool_sample_rate*100:.0f}%")
-    print(f"  Pubeval: {pubeval_sample_rate*100:.0f}%")
-    print(f"  Random: {random_sample_rate*100:.0f}%")
-    print()
-    if use_eval_lookahead:
-        print(f"EVAL LOOKAHEAD: Enabled (k={eval_lookahead_k})")
-    print("=" * 70)
-    print()
-    
-    if hasattr(agent, "set_eval_mode"):
-        agent.set_eval_mode(False)
-        print("[Training] Agent in TRAINING mode")
-    
-    train_bar = tqdm(range(n_games), desc="Training", ncols=120)
+    # Training loop
+    train_bar = tqdm(range(n_games), desc="Training", unit="game")
     
     for g in train_bar:
         # Select opponent
-        opponent_type = None
+        opponent = None
+        opponent_type = 'self_play'
+        
         if use_opponent_pool and opponent_pool and len(opponent_pool) > 0:
-            rand = np.random.random()
-            if rand < pool_sample_rate:
+            r = random.random()
+            if r < pool_sample_rate:
                 opponent = opponent_pool.sample_opponent(bias_recent=True)
-                opponent_stats['pool'] += 1
-                opponent_type = 'pool'
-            elif rand < pool_sample_rate + pubeval_sample_rate:
+                if opponent is not None:
+                    opponent_type = 'pool'
+            elif r < pool_sample_rate + pubeval_sample_rate:
                 opponent = pubeval
-                opponent_stats['pubeval'] += 1
+                opponent_type = 'pubeval'
+            elif r < pool_sample_rate + pubeval_sample_rate + random_sample_rate:
+                opponent = randomAgent
+                opponent_type = 'random'
+        else:
+            # No pool - mix of pubeval and random
+            if random.random() < 0.7:
+                opponent = pubeval
                 opponent_type = 'pubeval'
             else:
                 opponent = randomAgent
-                opponent_stats['random'] += 1
                 opponent_type = 'random'
-        else:
-            opponent = agent
-            opponent_stats['self'] += 1
-            opponent_type = 'self'
         
-        # Play training game
-        winner, final_board = play_one_game(agent, opponent, training=True, commentary=False)
-
+        # Default to self-play if no opponent selected
+        if opponent is None:
+            opponent = agent_instance
+            opponent_type = 'self_play'
+        
+        opponent_stats[opponent_type] += 1
+        
+        # Play game
+        play_one_game(agent_instance, opponent, training=True)
+        
         # Update progress bar
         if g % 100 == 0:
             postfix = {
-                "steps": getattr(agent, '_steps', 0),
-                "updates": getattr(agent, '_updates', 0),
-                "ent": f"{getattr(agent, '_current_entropy_coef', agent.CFG.entropy_coef):.4f}",
+                "steps": f"{agent_instance.steps:,}",
+                "upd": agent_instance.updates
             }
             
-            if hasattr(agent, '_rollout_stats'):
-                stats = agent._rollout_stats
-                if stats['nA_values']:
-                    recent_nA = stats['nA_values'][-100:]
-                    postfix["nA"] = f"{np.mean(recent_nA):.1f}"
-            
-            if sum(opponent_stats.values()) > 0:
-                total = sum(opponent_stats.values())
-                pub_pct = 100.0 * opponent_stats['pubeval'] / total
+            # Add opponent stats to postfix
+            total_opp_games = sum(opponent_stats.values())
+            if total_opp_games > 0:
+                self_pct = 100.0 * opponent_stats['self_play'] / total_opp_games
+                pool_pct = 100.0 * opponent_stats['pool'] / total_opp_games
+                pub_pct = 100.0 * opponent_stats['pubeval'] / total_opp_games
+                
+                postfix["self%"] = f"{self_pct:.0f}"
+                postfix["pool%"] = f"{pool_pct:.0f}"
                 postfix["pub%"] = f"{pub_pct:.0f}"
             
             train_bar.set_postfix(postfix)
@@ -504,7 +460,7 @@ def train(
         # Add snapshot to opponent pool
         if use_opponent_pool and opponent_pool and (g % pool_snapshot_every) == 0 and g > 0:
             latest_path = agent.CHECKPOINT_PATH.parent / f"latest_ppo_{model_size}.pt"
-            agent.save(str(latest_path))
+            agent_instance.save(str(latest_path))
             opponent_pool.add_snapshot(latest_path, label=f"(after {g:,} games)")
             print(f"\n{opponent_pool.get_pool_info()}")
 
@@ -512,14 +468,13 @@ def train(
         if (g % n_epochs) == 0:
             print()
             
-            if hasattr(agent, "set_eval_mode"): 
-                agent.set_eval_mode(True)
-                print("[Eval] Agent in EVAL mode")
+            agent_instance.set_eval_mode(True)
+            print("[Eval] Agent in EVAL mode")
             
             print(f"\n--- Evaluation after {g:,} games ---")
             
             # Greedy evaluation
-            wr = evaluate(agent, baseline, n_eval, 
+            wr = evaluate(agent_instance, baseline, n_eval, 
                          label=f"vs {eval_vs} (greedy)", 
                          debug_sides=True,
                          use_lookahead=False)
@@ -527,7 +482,7 @@ def train(
             
             # Lookahead evaluation
             if use_eval_lookahead:
-                wr_lookahead = evaluate(agent, baseline, min(100, n_eval), 
+                wr_lookahead = evaluate(agent_instance, baseline, min(100, n_eval), 
                                        label=f"vs {eval_vs}", 
                                        debug_sides=True,
                                        use_lookahead=True,
@@ -539,7 +494,7 @@ def train(
             
             # Random sanity check
             try:
-                wr_rand = evaluate(agent, randomAgent, max(50, n_eval // 2),
+                wr_rand = evaluate(agent_instance, randomAgent, max(50, n_eval // 2),
                                  label="vs random",
                                  debug_sides=True,
                                  use_lookahead=False)
@@ -551,10 +506,10 @@ def train(
                 print(f"[Eval] Skipped vs-random: {e}")
 
             # PPO stats
-            print(f"[PPO] Updates: {agent._updates}, Entropy: {agent._current_entropy_coef:.4f}")
+            print(f"[PPO] Updates: {agent_instance.updates}, Entropy: {agent_instance.current_entropy_coef:.4f}")
             
-            if hasattr(agent, '_rollout_stats'):
-                stats = agent._rollout_stats
+            if hasattr(agent_instance, 'rollout_stats'):
+                stats = agent_instance.rollout_stats
                 stats_list = []
                 if stats['nA_values']:
                     stats_list.append(f"Avg nA: {np.mean(stats['nA_values'][-500:]):.1f}")
@@ -567,18 +522,17 @@ def train(
 
             # Save checkpoints
             latest_path = agent.CHECKPOINT_PATH.parent / f"latest_ppo_{model_size}.pt"
-            _safe_save_agent(agent, latest_path, label="latest")
+            _safe_save_agent(agent_instance, latest_path, label="latest")
             
-            if hasattr(agent, "save") and wr > best_wr:
-                _safe_save_agent(agent, agent.CHECKPOINT_PATH, label="best")
+            if wr > best_wr:
+                _safe_save_agent(agent_instance, agent.CHECKPOINT_PATH, label="best")
                 best_wr = wr
                 print(f"[Checkpoint] New best: {best_wr:.3f}%")
             else:
                 print(f"[Checkpoint] Best: {best_wr:.3f}%")
 
-            if hasattr(agent, "set_eval_mode"): 
-                agent.set_eval_mode(False)
-                print("[Training] Back to TRAINING mode")
+            agent_instance.set_eval_mode(False)
+            print("[Training] Back to TRAINING mode")
             
             print()
         
@@ -590,13 +544,12 @@ def train(
             print("=" * 70)
             
             temp_league_path = Path(checkpoint_base_path) / f"temp_league_{model_size}.pt"
-            agent.save(str(temp_league_path))
+            agent_instance.save(str(temp_league_path))
             league.add_checkpoint(g, str(temp_league_path))
             
-            if hasattr(agent, "set_eval_mode"): 
-                agent.set_eval_mode(True)
+            agent_instance.set_eval_mode(True)
             
-            league_results = league.evaluate_against_league(agent, n_eval_per_opponent=n_eval_league)
+            league_results = league.evaluate_against_league(agent_instance, n_eval_per_opponent=n_eval_league)
             
             if league_results:
                 valid_results = [v for v in league_results.values() if v is not None]
@@ -609,8 +562,7 @@ def train(
                     
                     print(f"\nAverage win-rate vs league: {avg_league_wr:.1f}%")
             
-            if hasattr(agent, "set_eval_mode"): 
-                agent.set_eval_mode(False)
+            agent_instance.set_eval_mode(False)
             
             print()
 
@@ -638,12 +590,12 @@ def train(
     
     print()
     print("Final PPO State:")
-    print(f"  Updates: {agent._updates}")
-    print(f"  Steps: {agent._steps}")
-    print(f"  Entropy coef: {agent._current_entropy_coef:.4f}")
+    print(f"  Updates: {agent_instance.updates}")
+    print(f"  Steps: {agent_instance.steps}")
+    print(f"  Entropy coef: {agent_instance.current_entropy_coef:.4f}")
     
-    if hasattr(agent, '_rollout_stats'):
-        stats = agent._rollout_stats
+    if hasattr(agent_instance, 'rollout_stats'):
+        stats = agent_instance.rollout_stats
         if stats['nA_values']:
             print(f"  Avg legal actions: {np.mean(stats['nA_values'][-1000:]):.1f}")
         if stats['masked_entropy']:
@@ -658,7 +610,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Train PPO agent for backgammon')
     parser.add_argument('--model-size', type=str, default='large', 
                        choices=['small', 'medium', 'large'],
-                       help='Model size: small (CPU), medium (T4 GPU), large (good GPU)')
+                       help='Model size: small (CPU), medium (M1/M2/T4 GPU), large (good GPU)')
     parser.add_argument('--n-games', type=int, default=200_000,
                        help='Total number of training games')
     parser.add_argument('--n-epochs', type=int, default=5_000,
