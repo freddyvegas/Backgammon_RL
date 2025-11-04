@@ -423,6 +423,11 @@ class PPOAgent:
             'advantages': [],
             'masked_entropy': [],
             'value_loss_std': [],
+            'policy_loss': [],
+            'value_loss': [],
+            'entropy_loss': [],
+            'total_loss': [],
+            'grad_norm': [],
         }
         
         print(f"[PPOAgent] Network parameters: {sum(p.numel() for p in self.acnet.parameters()):,}")
@@ -503,6 +508,27 @@ class PPOAgent:
         
         print(f"[PPOAgent] Loaded checkpoint from {path}")
         print(f"  Steps: {self.steps}, Updates: {self.updates}")
+
+    def batch_score(self, states_np, cand_states_np, masks_np):
+        """
+        Batched policy/value for multiple envs.
+
+        Args:
+            states_np:     [B, state_dim] float32
+            cand_states_np:[B, max_actions, state_dim] float32 (padded)
+            masks_np:      [B, max_actions] float32 {0,1}
+        Returns:
+            logits: [B, max_actions]
+            values: [B]
+        """
+        states_t = torch.as_tensor(states_np, dtype=torch.float32, device=self.device)
+        cand_t   = torch.as_tensor(cand_states_np, dtype=torch.float32, device=self.device)
+        masks_t  = torch.as_tensor(masks_np, dtype=torch.float32, device=self.device)
+
+        deltas_t = cand_t - states_t.unsqueeze(1)                 # [B, A, 30]
+        with torch.no_grad():
+            logits, values = self.acnet(states_t, deltas_t, masks_t)  # logits: [B,A], values: [B]
+        return logits, values
     
     def _compute_gae(self, rewards, values, dones):
         """Compute Generalized Advantage Estimation."""
@@ -641,9 +667,26 @@ class PPOAgent:
         # Decay entropy coefficient
         self.current_entropy_coef = max(self.current_entropy_coef * self.config.entropy_decay, self.config.entropy_min)
         
-        # Store stats for this rollout
-        self.rollout_stats['masked_entropy'].append(np.mean(epoch_entropies))
-        self.rollout_stats['value_loss_std'].append(np.std(epoch_value_losses))
+        # Store stats for this rollout - averages across all epochs/batches
+        if epoch_policy_losses:
+            self.rollout_stats['policy_loss'].append(np.mean(epoch_policy_losses))
+        if epoch_value_losses:
+            self.rollout_stats['value_loss'].append(np.mean(epoch_value_losses))
+        if epoch_entropies:
+            self.rollout_stats['entropy_loss'].append(np.mean(epoch_entropies))
+            self.rollout_stats['masked_entropy'].append(np.mean(epoch_entropies))
+        
+        # Store total loss and grad norm
+        if epoch_policy_losses and epoch_value_losses and epoch_entropies:
+            total = np.mean(epoch_policy_losses) + self.config.critic_coef * np.mean(epoch_value_losses) - self.current_entropy_coef * np.mean(epoch_entropies)
+            self.rollout_stats['total_loss'].append(total)
+        
+        # Store gradient norm (last one from the update loop)
+        if 'grad_norm' in locals():
+            self.rollout_stats['grad_norm'].append(grad_norm)
+        
+        self.rollout_stats['value_loss_std'].append(np.std(epoch_value_losses) if epoch_value_losses else 0)
+
         
         # Logging every 10 updates
         if self.updates % 10 == 0:

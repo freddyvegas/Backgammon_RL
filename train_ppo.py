@@ -38,6 +38,9 @@ if torch.cuda.is_available():
 
 # Local checkpoint directory (no Google Drive)
 CHECKPOINT_DIR = "./checkpoints"
+BATCH_SIZE = 8  # or 16/32 for more parallel games
+
+print(f"Batch self-play games: {BATCH_SIZE} games in parallel")
 
 # --- Checkpoint helpers ---
 def _ensure_dir(path: Path) -> bool:
@@ -91,6 +94,207 @@ def _is_empty_move(move):
 def _apply_move_sequence(board, move_seq, player):
     mv = np.asarray(move_seq, dtype=np.int32)
     return backgammon.update_board(board, mv, player)
+
+def flip_to_pov_plus1(board: np.ndarray, player: int) -> np.ndarray:
+    """Return a +1-POV board for encoding; do NOT use for rules."""
+    if player == 1:
+        return board
+    b = board
+    out = np.zeros_like(b)
+    # points 1..24 reversed and sign-flipped so current player is positive
+    out[1:25] = -b[1:25][::-1]
+    # swap bars and borne-off bins, flip signs
+    out[25] = -b[26]   # +1 bar gets what was -1’s bar
+    out[26] = -b[25]
+    out[27] = -b[28]   # +1 borne-off gets what was -1’s borne-off
+    out[28] = -b[27]
+    return out
+
+def play_games_batched(agent_obj, opponent, batch_size=8, training=True):
+    """
+    Run up to `batch_size` games in parallel and feed batched states to the network.
+    Uses the same reward shaping and rollout buffer logic the agent expects.
+    """
+    finished = 0
+    # Each slot holds the current env state or None if finished
+    env_active = [True] * batch_size
+    boards     = []
+    players    = []
+    dices      = []
+    moves_left = []
+
+    # Initialize games
+    for _ in range(batch_size):
+        board = backgammon.init_board()
+        player = 1  # we’ll always feed +1 POV into the net
+        dice = backgammon.roll_dice()
+        boards.append(board)
+        players.append(player)
+        dices.append(dice)
+        moves_left.append(0)  # if you track a "moves_left" counter in state[29]
+
+    # Main loop until all batched envs finish
+    while any(env_active):
+        # Separate agent moves from opponent moves
+        agent_envs = []  # Environments where agent (player +1) needs to act
+        opponent_envs = []  # Environments where opponent (player -1) needs to act
+        
+        for idx in range(batch_size):
+            if not env_active[idx]:
+                continue
+            
+            player = players[idx]
+            dice = dices[idx]
+            board = boards[idx]
+            
+            # Check for legal moves
+            pmoves, pboards = backgammon.legal_moves(board, dice, player)
+            if len(pmoves) == 0:
+                # No legal moves, switch players
+                players[idx] = -player
+                dices[idx] = backgammon.roll_dice()
+                continue
+            
+            if player == 1:
+                agent_envs.append((idx, dice, board, pmoves, pboards))
+            else:
+                opponent_envs.append((idx, dice, board, pmoves, pboards))
+        
+        # ---- Process agent moves in batch ----
+        if agent_envs:
+            batch_states = []
+            batch_cand_states = []
+            batch_masks = []
+            per_env_candidates = []
+            
+            for (idx, dice, board, pmoves, pboards) in agent_envs:
+                # Encode current state S in +1 POV for the network
+                board_pov = flip_to_pov_plus1(board, 1)  # player=1
+                S = np.zeros(30, dtype=np.float32)
+                S[:29] = board_pov
+                S[29] = float(moves_left[idx])
+                
+                # Build candidates
+                cand_states = np.zeros((agent_obj.config.max_actions, 30), dtype=np.float32)
+                mask = np.zeros(agent_obj.config.max_actions, dtype=np.float32)
+                
+                nA = min(len(pboards), agent_obj.config.max_actions)
+                for a in range(nA):
+                    cand_board_pov = flip_to_pov_plus1(pboards[a], 1)
+                    cand = np.zeros(30, dtype=np.float32)
+                    cand[:29] = cand_board_pov
+                    cand[29] = max(S[29] - 1.0, 0.0)
+                    cand_states[a] = cand
+                    mask[a] = 1.0
+                
+                batch_states.append(S)
+                batch_cand_states.append(cand_states)
+                batch_masks.append(mask)
+                per_env_candidates.append((idx, pmoves, pboards))
+            
+            # Batched forward pass for agent
+            states_np = np.stack(batch_states, axis=0)
+            cand_states_np = np.stack(batch_cand_states, axis=0)
+            masks_np = np.stack(batch_masks, axis=0)
+            
+            logits, values = agent_obj.batch_score(states_np, cand_states_np, masks_np)
+            
+            # Action selection
+            logits = logits.masked_fill(torch.as_tensor(masks_np, device=logits.device) == 0, -1e9)
+            if training and not agent_obj.eval_mode:
+                probs = torch.softmax(logits, dim=-1)
+                a_idxs = torch.multinomial(probs, num_samples=1).squeeze(1).tolist()
+                log_probs = torch.log(torch.gather(probs, 1, torch.tensor(a_idxs, device=probs.device).unsqueeze(1)).squeeze(1) + 1e-9).tolist()
+            else:
+                a_idxs = torch.argmax(logits, dim=-1).tolist()
+                log_probs = [0.0] * len(a_idxs)
+            
+            # Apply agent actions
+            for row, (idx, pmoves, pboards) in enumerate(per_env_candidates):
+                a_idx = int(a_idxs[row])
+                if a_idx >= len(pmoves):
+                    a_idx = len(pmoves) - 1
+                
+                chosen_move = pmoves[a_idx]
+                old_board = boards[idx].copy()
+                boards[idx] = backgammon.update_board(boards[idx], chosen_move, 1)  # player=1
+                
+                # Compute reward
+                reward = 0.0
+                terminal_reward = 0.0
+                if boards[idx][27] == 15:  # Agent wins
+                    terminal_reward = 1.0
+                elif boards[idx][28] == -15:  # Agent loses
+                    terminal_reward = -1.0
+                
+                # Shaped reward
+                shaped_reward = 0.0
+                if training and not agent_obj.eval_mode and agent_obj.config.use_reward_shaping:
+                    board_pov_old = flip_to_pov_plus1(old_board, 1)
+                    board_pov_new = flip_to_pov_plus1(boards[idx], 1)
+                    shaped_reward = agent_obj._compute_shaped_reward(board_pov_old, board_pov_new)
+                
+                reward = terminal_reward + shaped_reward
+                
+                # Store in rollout buffer
+                if training and not agent_obj.eval_mode:
+                    state = batch_states[row]
+                    cand_states_for_this = batch_cand_states[row]
+                    mask_for_this = batch_masks[row]
+                    log_prob = log_probs[row]
+                    value = values[row].item() if hasattr(values[row], 'item') else float(values[row])
+                    
+                    agent_obj.buffer.push(
+                        state, cand_states_for_this, mask_for_this,
+                        a_idx, log_prob, value, reward,
+                        done=(terminal_reward != 0.0)
+                    )
+                    agent_obj.steps += 1
+                    
+                    # Trigger PPO update if buffer is full
+                    if agent_obj.buffer.is_ready():
+                        agent_obj._ppo_update()
+                
+                # Check if game over
+                done = backgammon.game_over(boards[idx])
+                if done:
+                    env_active[idx] = False
+                    finished += 1
+                else:
+                    players[idx] = -1  # Switch to opponent
+                    dices[idx] = backgammon.roll_dice()
+        
+        # ---- Process opponent moves individually ----
+        for (idx, dice, board, pmoves, pboards) in opponent_envs:
+            # Opponent makes a move
+            if opponent == randomAgent:
+                # Random opponent
+                move = randomAgent.action(board, dice, -1, 0)
+            elif opponent == pubeval:
+                # Pubeval opponent
+                move = pubeval.action(board, dice, -1, 0)
+            elif hasattr(opponent, 'action'):
+                # Another agent (from pool or self-play)
+                move = opponent.action(board, dice, -1, 0, train=False)
+            else:
+                # Fallback to random
+                import random as py_random
+                move = pmoves[py_random.randint(0, len(pmoves) - 1)]
+            
+            if not _is_empty_move(move):
+                boards[idx] = _apply_move_sequence(board, move, -1)
+            
+            # Check if game over
+            done = backgammon.game_over(boards[idx])
+            if done:
+                env_active[idx] = False
+                finished += 1
+            else:
+                players[idx] = 1  # Switch back to agent
+                dices[idx] = backgammon.roll_dice()
+    
+    return finished
+
 
 # --- Top-k one-ply lookahead (FIXED: POV-aware) ---
 def select_move_with_lookahead(agent_obj, board_pov, dice, i, k=3):
@@ -399,15 +603,23 @@ def train(n_games=200_000,
     }
     
     # Training loop
-    train_bar = tqdm(range(n_games), desc="Training", unit="game")
-    
-    for g in train_bar:
-        # Select opponent
+    train_bar = tqdm(total=n_games, desc="Training", unit="game")
+    games_done = 0
+
+    # Schedule thresholds (not modulo-based anymore)
+    next_eval_at = n_epochs
+    next_snapshot_at = pool_snapshot_every
+
+    while games_done < n_games:
+        # Choose opponent ONCE for this batch (simple; you can diversify per slot later)
         opponent = None
         opponent_type = 'self_play'
-        
         if use_opponent_pool and opponent_pool and len(opponent_pool) > 0:
             r = random.random()
+            # IMPROVED CURRICULUM: Reduce random opponent dramatically
+            # Pool opponents are past versions (self-play curriculum)
+            # Pubeval is a strong baseline
+            # Random is only kept at 5% for robustness/diversity
             if r < pool_sample_rate:
                 opponent = opponent_pool.sample_opponent(bias_recent=True)
                 if opponent is not None:
@@ -419,154 +631,94 @@ def train(n_games=200_000,
                 opponent = randomAgent
                 opponent_type = 'random'
         else:
-            # No pool - mix of pubeval and random
-            if random.random() < 0.7:
+            # Before pool is populated: train primarily against pubeval
+            # Random opponent is problematic - it gives weak/misleading signal
+            if random.random() < 0.95:  # 95% pubeval, 5% random
                 opponent = pubeval
                 opponent_type = 'pubeval'
             else:
                 opponent = randomAgent
                 opponent_type = 'random'
-        
-        # Default to self-play if no opponent selected
         if opponent is None:
             opponent = agent_instance
             opponent_type = 'self_play'
-        
-        opponent_stats[opponent_type] += 1
-        
-        # Play game
-        play_one_game(agent_instance, opponent, training=True)
-        
-        # Update progress bar
-        if g % 100 == 0:
-            postfix = {
-                "steps": f"{agent_instance.steps:,}",
-                "upd": agent_instance.updates
-            }
+
+        # Run one batched rollout of complete games
+        finished = play_games_batched(agent_instance, opponent, batch_size=BATCH_SIZE, training=True)
+
+        # Clamp so we never exceed target (in case last batch overshoots)
+        if games_done + finished > n_games:
+            finished = n_games - games_done
+
+        # Accounting
+        games_done += finished
+        train_bar.update(finished)
+        opponent_stats[opponent_type] += finished
+
+        # Update bar postfix periodically
+        if games_done % 100 == 0 or games_done == n_games:
+            postfix = {"steps": f"{agent_instance.steps:,}", "upd": agent_instance.updates}
             
-            # Add opponent stats to postfix
+            # Add loss values from recent updates
+            if hasattr(agent_instance, 'rollout_stats'):
+                stats = agent_instance.rollout_stats
+                if stats['policy_loss'] and len(stats['policy_loss']) > 0:
+                    postfix["πL"] = f"{stats['policy_loss'][-1]:.3f}"  # Policy loss
+                if stats['value_loss'] and len(stats['value_loss']) > 0:
+                    postfix["VL"] = f"{stats['value_loss'][-1]:.3f}"  # Value loss
+                if stats['grad_norm'] and len(stats['grad_norm']) > 0:
+                    postfix["∇"] = f"{stats['grad_norm'][-1]:.2f}"  # Grad norm
+            
             total_opp_games = sum(opponent_stats.values())
             if total_opp_games > 0:
-                self_pct = 100.0 * opponent_stats['self_play'] / total_opp_games
-                pool_pct = 100.0 * opponent_stats['pool'] / total_opp_games
-                pub_pct = 100.0 * opponent_stats['pubeval'] / total_opp_games
-                
-                postfix["self%"] = f"{self_pct:.0f}"
-                postfix["pool%"] = f"{pool_pct:.0f}"
-                postfix["pub%"] = f"{pub_pct:.0f}"
-            
+                postfix["self%"] = f"{100.0 * opponent_stats['self_play'] / total_opp_games:.0f}"
+                postfix["pool%"] = f"{100.0 * opponent_stats['pool'] / total_opp_games:.0f}"
+                postfix["pub%"]  = f"{100.0 * opponent_stats['pubeval'] / total_opp_games:.0f}"
+                postfix["rnd%"]  = f"{100.0 * opponent_stats['random'] / total_opp_games:.0f}"
             train_bar.set_postfix(postfix)
-        
-        # Add snapshot to opponent pool
-        if use_opponent_pool and opponent_pool and (g % pool_snapshot_every) == 0 and g > 0:
+
+        # Snapshot by threshold (used to be g % pool_snapshot_every)
+        while use_opponent_pool and opponent_pool and games_done >= next_snapshot_at and next_snapshot_at > 0:
             latest_path = agent.CHECKPOINT_PATH.parent / f"latest_ppo_{model_size}.pt"
             agent_instance.save(str(latest_path))
-            opponent_pool.add_snapshot(latest_path, label=f"(after {g:,} games)")
+            opponent_pool.add_snapshot(latest_path, label=f"(after {next_snapshot_at:,} games)")
             print(f"\n{opponent_pool.get_pool_info()}")
+            next_snapshot_at += pool_snapshot_every  # schedule next threshold
 
-        # Regular evaluation
-        if (g % n_epochs) == 0:
+        # Evaluate by threshold (used to be if (g % n_epochs) == 0)
+        while games_done >= next_eval_at and next_eval_at > 0:
             print()
-            
             agent_instance.set_eval_mode(True)
             print("[Eval] Agent in EVAL mode")
-            
-            print(f"\n--- Evaluation after {g:,} games ---")
-            
-            # Greedy evaluation
-            wr = evaluate(agent_instance, baseline, n_eval, 
-                         label=f"vs {eval_vs} (greedy)", 
-                         debug_sides=True,
-                         use_lookahead=False)
+            print(f"\n--- Evaluation after {next_eval_at:,} games ---")
+
+            wr = evaluate(agent_instance, baseline, n_eval,
+                        label=f"vs {eval_vs} (greedy)",
+                        debug_sides=True, use_lookahead=False)
             perf_data['vs_baseline'].append(wr)
-            
-            # Lookahead evaluation
+
             if use_eval_lookahead:
-                wr_lookahead = evaluate(agent_instance, baseline, min(100, n_eval), 
-                                       label=f"vs {eval_vs}", 
-                                       debug_sides=True,
-                                       use_lookahead=True,
-                                       lookahead_k=eval_lookahead_k)
+                wr_lookahead = evaluate(agent_instance, baseline, min(100, n_eval),
+                                        label=f"vs {eval_vs}",
+                                        debug_sides=True, use_lookahead=True,
+                                        lookahead_k=eval_lookahead_k)
                 perf_data['vs_baseline_lookahead'].append(wr_lookahead)
-                
-                improvement = wr_lookahead - wr
-                print(f"  Lookahead improvement: +{improvement:.1f}% points")
-            
-            # Random sanity check
+                print(f"  Lookahead improvement: +{(wr_lookahead - wr):.1f}% points")
+
             try:
                 wr_rand = evaluate(agent_instance, randomAgent, max(50, n_eval // 2),
-                                 label="vs random",
-                                 debug_sides=True,
-                                 use_lookahead=False)
+                                label="vs random", debug_sides=True, use_lookahead=False)
                 perf_data['vs_random'].append(wr_rand)
-                
                 if wr_rand < 50.0:
                     print(f"  ⚠️  WARNING: Only {wr_rand:.1f}% vs random!")
             except Exception as e:
                 print(f"[Eval] Skipped vs-random: {e}")
 
-            # PPO stats
-            print(f"[PPO] Updates: {agent_instance.updates}, Entropy: {agent_instance.current_entropy_coef:.4f}")
-            
-            if hasattr(agent_instance, 'rollout_stats'):
-                stats = agent_instance.rollout_stats
-                stats_list = []
-                if stats['nA_values']:
-                    stats_list.append(f"Avg nA: {np.mean(stats['nA_values'][-500:]):.1f}")
-                if stats['masked_entropy']:
-                    stats_list.append(f"Entropy: {np.mean(stats['masked_entropy'][-10:]):.4f}")
-                if stats['advantages']:
-                    stats_list.append(f"|Adv|: {np.mean(np.abs(stats['advantages'][-500:])):.3f}")
-                if stats_list:
-                    print(f"  Stats: {', '.join(stats_list)}")
-
-            # Save checkpoints
-            latest_path = agent.CHECKPOINT_PATH.parent / f"latest_ppo_{model_size}.pt"
-            _safe_save_agent(agent_instance, latest_path, label="latest")
-            
-            if wr > best_wr:
-                _safe_save_agent(agent_instance, agent.CHECKPOINT_PATH, label="best")
-                best_wr = wr
-                print(f"[Checkpoint] New best: {best_wr:.3f}%")
-            else:
-                print(f"[Checkpoint] Best: {best_wr:.3f}%")
-
             agent_instance.set_eval_mode(False)
-            print("[Training] Back to TRAINING mode")
-            
-            print()
-        
-        # League evaluation
-        if (g % league_checkpoint_every) == 0 and g > 0:
-            print()
-            print("=" * 70)
-            print(f"LEAGUE CHECKPOINT at {g:,} games")
-            print("=" * 70)
-            
-            temp_league_path = Path(checkpoint_base_path) / f"temp_league_{model_size}.pt"
-            agent_instance.save(str(temp_league_path))
-            league.add_checkpoint(g, str(temp_league_path))
-            
-            agent_instance.set_eval_mode(True)
-            
-            league_results = league.evaluate_against_league(agent_instance, n_eval_per_opponent=n_eval_league)
-            
-            if league_results:
-                valid_results = [v for v in league_results.values() if v is not None]
-                if valid_results:
-                    avg_league_wr = np.mean(valid_results)
-                    perf_data['vs_league_avg'].append(avg_league_wr)
-                    
-                    most_recent = max(league_results.keys())
-                    perf_data['vs_latest_checkpoint'].append(league_results[most_recent])
-                    
-                    print(f"\nAverage win-rate vs league: {avg_league_wr:.1f}%")
-            
-            agent_instance.set_eval_mode(False)
-            
-            print()
+            next_eval_at += n_epochs  # schedule next threshold
 
     train_bar.close()
+
     
     # Final statistics
     print()
@@ -650,13 +802,13 @@ if __name__ == "__main__":
             n_eval=200,
             eval_vs="pubeval",
             model_size=args.model_size,
-            # Improved curriculum
+            # Improved curriculum - reduced random opponent
             use_opponent_pool=True,
             pool_snapshot_every=5_000,
             pool_max_size=12,
-            pool_sample_rate=0.45,
-            pubeval_sample_rate=0.30,
-            random_sample_rate=0.25,
+            pool_sample_rate=0.50,      # 50% pool (self-play curriculum)
+            pubeval_sample_rate=0.45,   # 45% pubeval (strong baseline)
+            random_sample_rate=0.05,    # 5% random (robustness only)
             # Evaluation
             use_eval_lookahead=True,
             eval_lookahead_k=3,
