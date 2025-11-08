@@ -41,13 +41,14 @@ class OpponentPool:
     """
 
     def __init__(self, pool_dir: Path, agent_module_name: str = "ppo_agent",
-                 max_size: int = 12, seed: int = 42):
+                 max_size: int = 12, seed: int = 42, device: str = None):
         """
         Args:
             pool_dir: Directory to store opponent snapshots
             agent_module_name: Name of agent module to import (must expose PPOAgent)
             max_size: Maximum number of snapshots to keep
             seed: Random seed for opponent sampling
+            device: Device for opponents ('cpu', 'cuda', 'mps', or None for auto-detect)
         """
         self.pool_dir = Path(pool_dir)
         self.pool_dir.mkdir(parents=True, exist_ok=True)
@@ -57,7 +58,12 @@ class OpponentPool:
         self._snapshot_counter = 0
         
         # Determine device for opponents
-        self.device = get_device()
+        if device is not None:
+            self.device = device
+            print(f"OpponentPool using explicit device: {device}")
+        else:
+            self.device = get_device()
+            print(f"OpponentPool using auto-detected device: {self.device}")
 
         self._load_existing_snapshots()
         random.seed(seed)

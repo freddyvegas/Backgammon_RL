@@ -21,6 +21,7 @@ import random
 import torch
 import torch.nn.functional as F
 import argparse
+import importlib
 
 import backgammon
 import pubeval_player as pubeval
@@ -168,23 +169,18 @@ def play_games_batched(agent_obj, opponent, batch_size=8, training=True):
             per_env_candidates = []
             
             for (idx, dice, board, pmoves, pboards) in agent_envs:
-                # Encode current state S in +1 POV for the network
+                # Encode current state S in +1 POV for the network (29 dims only)
                 board_pov = flip_to_pov_plus1(board, 1)  # player=1
-                S = np.zeros(30, dtype=np.float32)
-                S[:29] = board_pov
-                S[29] = float(moves_left[idx])
+                S = board_pov.astype(np.float32)  # Just the board, 29 dims
                 
                 # Build candidates
-                cand_states = np.zeros((agent_obj.config.max_actions, 30), dtype=np.float32)
+                cand_states = np.zeros((agent_obj.config.max_actions, 29), dtype=np.float32)
                 mask = np.zeros(agent_obj.config.max_actions, dtype=np.float32)
                 
                 nA = min(len(pboards), agent_obj.config.max_actions)
                 for a in range(nA):
                     cand_board_pov = flip_to_pov_plus1(pboards[a], 1)
-                    cand = np.zeros(30, dtype=np.float32)
-                    cand[:29] = cand_board_pov
-                    cand[29] = max(S[29] - 1.0, 0.0)
-                    cand_states[a] = cand
+                    cand_states[a] = cand_board_pov.astype(np.float32)
                     mask[a] = 1.0
                 
                 batch_states.append(S)
@@ -236,6 +232,9 @@ def play_games_batched(agent_obj, opponent, batch_size=8, training=True):
                 
                 reward = terminal_reward + shaped_reward
                 
+                # Apply reward scaling (prevents value function collapse with sparse rewards)
+                reward = reward * agent_obj.config.reward_scale
+                
                 # Store in rollout buffer
                 if training and not agent_obj.eval_mode:
                     state = batch_states[row]
@@ -244,6 +243,9 @@ def play_games_batched(agent_obj, opponent, batch_size=8, training=True):
                     log_prob = log_probs[row]
                     value = values[row].item() if hasattr(values[row], 'item') else float(values[row])
                     
+                    # DEBUG: Track before incrementing
+                    old_steps = agent_obj.steps
+                    
                     agent_obj.buffer.push(
                         state, cand_states_for_this, mask_for_this,
                         a_idx, log_prob, value, reward,
@@ -251,9 +253,17 @@ def play_games_batched(agent_obj, opponent, batch_size=8, training=True):
                     )
                     agent_obj.steps += 1
                     
+                    # DEBUG: Print every 100 steps
+                    if agent_obj.steps % 100 == 0 or agent_obj.steps <= 10:
+                        print(f"    [TRAIN] Game env {idx}: steps {old_steps}→{agent_obj.steps}, "
+                              f"buffer {agent_obj.buffer.size}/{agent_obj.config.rollout_length}, "
+                              f"updates {agent_obj.updates}, reward {reward:.3f}")
+                    
                     # Trigger PPO update if buffer is full
                     if agent_obj.buffer.is_ready():
+                        print(f"    [UPDATE] Buffer full! Triggering PPO update #{agent_obj.updates + 1}")
                         agent_obj._ppo_update()
+                        print(f"    [UPDATE] Done! Steps={agent_obj.steps}, Updates={agent_obj.updates}")
                 
                 # Check if game over
                 done = backgammon.game_over(boards[idx])
@@ -498,6 +508,108 @@ class CheckpointLeague:
         return results
 
 
+def warmstart_with_pubeval(agent_obj, n_positions=50_000, batch=256):
+    """
+    Behavior cloning warm-start: imitate pubeval on random positions.
+    Pads candidates to (B, max_actions, 29) and uses a mask.
+    """
+    import torch
+    import torch.nn.functional as F
+
+    print(f"\n{'='*70}")
+    print("BEHAVIOR CLONING WARM-START")
+    print(f"{'='*70}")
+    print(f"Training policy to imitate pubeval on {n_positions:,} random positions...")
+    print("This gives a ~5–10% head-start vs pubeval without changing PPO logic\n")
+
+    device = agent_obj.device
+    maxA = agent_obj.config.max_actions
+
+    opt = torch.optim.Adam(agent_obj.acnet.parameters(), lr=3e-4)
+    agent_obj.acnet.train()
+
+    total_loss = 0.0
+    n_batches = 0
+
+    for i in range(0, n_positions, batch):
+        # sample random boards & dice
+        boards = [backgammon.init_board() for _ in range(batch)]
+        dice   = [backgammon.roll_dice() for _ in range(batch)]
+
+        X, D, M, y = [], [], [], []
+        for b, d in zip(boards, dice):
+            moves, afters = backgammon.legal_moves(b, d, player=1)
+            if not moves:
+                continue
+
+            # number of actions to consider (truncate to maxA)
+            nA = min(len(afters), maxA)
+
+            # score each after-state with pubeval (module already provides pieces)
+            scores = []
+            for after in afters[:nA]:
+                race = int(pubeval.israce(after))
+                pb28 = pubeval.pubeval_flip(after)
+                pos  = pubeval._to_int32_view(pb28)
+                scores.append(float(pubeval._pubeval_scalar(race, pos)))
+            best = int(np.argmax(scores))
+
+            # encode and pad
+            S = b.astype(np.float32)                          # (29,)
+            cand = np.zeros((maxA, 29), dtype=np.float32)     # (maxA, 29)
+            mask = np.zeros(maxA, dtype=np.float32)           # (maxA,)
+
+            if nA > 0:
+                cand[:nA] = np.stack([a.astype(np.float32) for a in afters[:nA]], axis=0)
+                mask[:nA] = 1.0
+
+            delta = cand - S                                  # (maxA, 29) via broadcast
+
+            X.append(S)
+            D.append(delta)
+            M.append(mask)
+            y.append(best)
+
+        # if this mini-batch had no legal positions, skip it
+        if not X:
+            continue
+
+        # tensors
+        S_t = torch.as_tensor(np.stack(X), dtype=torch.float32, device=device)          # (B,29)
+        D_t = torch.as_tensor(np.stack(D), dtype=torch.float32, device=device)          # (B,maxA,29)
+        M_t = torch.as_tensor(np.stack(M), dtype=torch.float32, device=device)          # (B,maxA)
+        y_t = torch.as_tensor(y,          dtype=torch.long,   device=device)            # (B,)
+
+        # forward
+        logits = agent_obj.acnet.score_moves_delta(S_t, D_t, M_t)                       # (B,maxA)
+        # mask invalid actions before softmax
+        logits = logits.masked_fill(M_t == 0, -1e9)
+        log_probs = torch.log_softmax(logits, dim=-1)
+        # NLL of teacher-chosen action
+        loss = -log_probs.gather(1, y_t.unsqueeze(1)).mean()
+
+        # optimize
+        opt.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(agent_obj.acnet.parameters(), 0.5)
+        opt.step()
+
+        total_loss += loss.item()
+        n_batches += 1
+
+        if (i // batch) % 50 == 0 and i > 0:
+            avg_loss = total_loss / max(1, n_batches)
+            print(f"  Progress: {i:,}/{n_positions:,} positions, avg loss: {avg_loss:.4f}")
+
+    avg_loss = total_loss / max(1, n_batches)
+    print(f"\n✓ Warm-start complete!")
+    print(f"  Total batches: {n_batches}")
+    print(f"  Average loss: {avg_loss:.4f}")
+    print(f"{'='*70}\n")
+
+    agent_obj.acnet.eval()
+
+
 def train(n_games=200_000, 
           n_epochs=5_000,
           n_eval=200,
@@ -511,6 +623,7 @@ def train(n_games=200_000,
           random_sample_rate=0.25,
           use_eval_lookahead=True,
           eval_lookahead_k=3,
+          use_bc_warmstart=False,
           league_checkpoint_every=20_000,
           n_eval_league=50):
     """
@@ -547,7 +660,17 @@ def train(n_games=200_000,
     
     # Initialize agent with specified model size
     cfg = agent.get_config(model_size)
-    device = agent.get_device()
+    
+    # Gentle hyperparameter tweaks for better curriculum learning
+    cfg.ppo_epochs = 3  # Reduced from 4 to reduce overfitting per rollout
+    cfg.entropy_min = 0.01  # Keep exploration alive longer
+    
+    # FORCE CPU: MPS has numerical stability issues with PPO!
+    # Symptoms: negative policy loss, exploding gradients, no learning
+    device = 'cpu'
+    print(f"\n⚠️  FORCING CPU DEVICE (MPS has known PPO bugs)")
+    print(f"   Expected: 2-3x slower than MPS, but actually learns!\n")
+    
     agent_instance = agent.PPOAgent(config=cfg, device=device)
     
     # Set checkpoint path based on model size
@@ -563,12 +686,34 @@ def train(n_games=200_000,
             pool_dir=pool_dir,
             agent_module_name="ppo_agent",
             max_size=pool_max_size,
-            seed=42
+            seed=42,
+            device=device  # Use same device as training agent
         )
         print(f"\nOpponent Pool Configuration:")
         print(f"  Snapshot every: {pool_snapshot_every:,} games")
         print(f"  Max size: {pool_max_size}")
         print(f"  Sample rates: Pool={pool_sample_rate:.0%}, Pubeval={pubeval_sample_rate:.0%}, Random={random_sample_rate:.0%}")
+        
+        # Verify existing pool if any
+        if len(opponent_pool) > 0:
+            print(f"\n{'='*60}")
+            print("EXISTING OPPONENT POOL FOUND")
+            print(f"{'='*60}")
+            opponent_pool.verify_snapshots()
+            print(f"{'='*60}\n")
+        else:
+            print(f"  Pool is empty - will seed with initial agent")
+            
+            # --- Seed the pool immediately so pool% > 0 from the start ---
+            print(f"\n{'='*60}")
+            print("SEEDING OPPONENT POOL")
+            print(f"{'='*60}")
+            latest_path = agent.CHECKPOINT_PATH.parent / f"latest_ppo_{model_size}.pt"
+            agent_instance.save(str(latest_path))
+            opponent_pool.add_snapshot(latest_path, label="(seed at 0 games)")
+            print(f"✓ Seed snapshot added")
+            print(f"{opponent_pool.get_pool_info()}")
+            print(f"{'='*60}\n")
         print()
     
     # Initialize checkpoint league
@@ -598,6 +743,7 @@ def train(n_games=200_000,
     opponent_stats = {
         'self_play': 0,
         'pool': 0,
+        'pool_best': 0,
         'pubeval': 0,
         'random': 0
     }
@@ -605,40 +751,97 @@ def train(n_games=200_000,
     # Training loop
     train_bar = tqdm(total=n_games, desc="Training", unit="game")
     games_done = 0
+    
+    # DEBUG: Initial state
+    print(f"\n[DEBUG] Initial agent state:")
+    print(f"  steps: {agent_instance.steps}")
+    print(f"  updates: {agent_instance.updates}")
+    print(f"  buffer size: {agent_instance.buffer.size}")
+    print(f"  rollout_length: {agent_instance.config.rollout_length}")
+    print(f"  eval_mode: {agent_instance.eval_mode}")
+    print(f"  Training: {not agent_instance.eval_mode}")
+    print()
 
     # Schedule thresholds (not modulo-based anymore)
     next_eval_at = n_epochs
     next_snapshot_at = pool_snapshot_every
+    
+    # Pool curriculum ramping parameters
+    pool_start_games = 5_000        # No pool before this - build competence first
+    pool_ramp_end = 50_000          # Linearly ramp pool% up to target by here
+    pool_target_rate = 0.30         # Desired steady-state pool usage
+    
+    # Track best checkpoint for stable curriculum
+    best_wr_vs_random = 0.0
+    best_ckpt_path = checkpoint_base_path / f"best_so_far_{model_size}.pt"
+    
+    print(f"\n{'='*60}")
+    print("TRAINING CONFIGURATION")
+    print(f"{'='*60}")
+    print(f"Opponent Pool: {'ENABLED' if use_opponent_pool else 'DISABLED'}")
+    if use_opponent_pool and opponent_pool:
+        print(f"  Initial pool size: {len(opponent_pool)}")
+        print(f"  Pool ramp: 0% @ {pool_start_games:,} → {pool_target_rate*100:.0f}% @ {pool_ramp_end:,} games")
+        print(f"  First snapshot at: {next_snapshot_at:,} games")
+        print(f"  Snapshot frequency: every {pool_snapshot_every:,} games")
+    print(f"Evaluation: every {n_epochs:,} games")
+    print(f"Total games: {n_games:,}")
+    print(f"{'='*60}\n")
+
+    # Optional: Behavior cloning warm-start
+    if use_bc_warmstart:
+        warmstart_with_pubeval(agent_instance, n_positions=50_000, batch=256)
 
     while games_done < n_games:
-        # Choose opponent ONCE for this batch (simple; you can diversify per slot later)
+        # Calculate effective pool rate based on curriculum ramp
+        if use_opponent_pool and opponent_pool and len(opponent_pool) > 0:
+            if games_done < pool_start_games:
+                effective_pool_rate = 0.0  # No pool pressure early
+            elif games_done < pool_ramp_end:
+                # Linear ramp from 0% to target%
+                t = (games_done - pool_start_games) / (pool_ramp_end - pool_start_games)
+                effective_pool_rate = pool_target_rate * max(0.0, min(1.0, t))
+            else:
+                effective_pool_rate = pool_target_rate  # Full pool pressure
+        else:
+            effective_pool_rate = 0.0
+        
+        # Choose opponent based on ramped curriculum
         opponent = None
         opponent_type = 'self_play'
-        if use_opponent_pool and opponent_pool and len(opponent_pool) > 0:
-            r = random.random()
-            # IMPROVED CURRICULUM: Reduce random opponent dramatically
-            # Pool opponents are past versions (self-play curriculum)
-            # Pubeval is a strong baseline
-            # Random is only kept at 5% for robustness/diversity
-            if r < pool_sample_rate:
-                opponent = opponent_pool.sample_opponent(bias_recent=True)
-                if opponent is not None:
-                    opponent_type = 'pool'
-            elif r < pool_sample_rate + pubeval_sample_rate:
-                opponent = pubeval
-                opponent_type = 'pubeval'
-            elif r < pool_sample_rate + pubeval_sample_rate + random_sample_rate:
-                opponent = randomAgent
-                opponent_type = 'random'
-        else:
-            # Before pool is populated: train primarily against pubeval
-            # Random opponent is problematic - it gives weak/misleading signal
-            if random.random() < 0.95:  # 95% pubeval, 5% random
-                opponent = pubeval
-                opponent_type = 'pubeval'
+        
+        r = random.random()
+        if r < effective_pool_rate:
+            # Sample from pool - bias toward older snapshots early, recent later
+            bias_recent = games_done >= pool_ramp_end
+            
+            # 50% chance to use best-so-far for stability
+            if random.random() < 0.5 and best_ckpt_path.exists():
+                try:
+                    agent_mod = importlib.import_module("ppo_agent")
+                    opponent = agent_mod.PPOAgent(device=device)
+                    opponent.load(str(best_ckpt_path), map_location=device)
+                    opponent.set_eval_mode(True)
+                    opponent_type = 'pool_best'
+                except Exception as e:
+                    # Fall back to regular pool sampling
+                    opponent = opponent_pool.sample_opponent(bias_recent=bias_recent)
+                    opponent_type = 'pool' if opponent is not None else 'self_play'
             else:
-                opponent = randomAgent
-                opponent_type = 'random'
+                opponent = opponent_pool.sample_opponent(bias_recent=bias_recent)
+                opponent_type = 'pool' if opponent is not None else 'self_play'
+            
+            # Debug: Log pool usage occasionally
+            if games_done % 1000 == 0 and opponent_type != 'self_play':
+                ramp_pct = effective_pool_rate * 100
+                print(f"  [Pool] Sampling at {ramp_pct:.1f}% rate (target: {pool_target_rate*100:.0f}%)")
+        elif r < effective_pool_rate + pubeval_sample_rate:
+            opponent = pubeval
+            opponent_type = 'pubeval'
+        elif r < effective_pool_rate + pubeval_sample_rate + random_sample_rate:
+            opponent = randomAgent
+            opponent_type = 'random'
+        # else: self-play (remaining probability)
         if opponent is None:
             opponent = agent_instance
             opponent_type = 'self_play'
@@ -654,6 +857,17 @@ def train(n_games=200_000,
         games_done += finished
         train_bar.update(finished)
         opponent_stats[opponent_type] += finished
+        
+        # DEBUG: After first batch
+        if games_done == BATCH_SIZE:
+            print(f"\n[DEBUG] After first batch ({BATCH_SIZE} games):")
+            print(f"  steps: {agent_instance.steps} (expected ~{BATCH_SIZE * 30})")
+            print(f"  updates: {agent_instance.updates}")
+            print(f"  buffer size: {agent_instance.buffer.size}")
+            if agent_instance.steps == 0:
+                print(f"  ⚠️  WARNING: No steps after {BATCH_SIZE} games!")
+                print(f"  ⚠️  This means agent moves are not being recorded!")
+            print()
 
         # Update bar postfix periodically
         if games_done % 100 == 0 or games_done == n_games:
@@ -679,10 +893,50 @@ def train(n_games=200_000,
 
         # Snapshot by threshold (used to be g % pool_snapshot_every)
         while use_opponent_pool and opponent_pool and games_done >= next_snapshot_at and next_snapshot_at > 0:
+            print(f"\n{'='*60}")
+            print(f"SNAPSHOT CHECKPOINT at {games_done:,} games")
+            print(f"{'='*60}")
+            
             latest_path = agent.CHECKPOINT_PATH.parent / f"latest_ppo_{model_size}.pt"
             agent_instance.save(str(latest_path))
-            opponent_pool.add_snapshot(latest_path, label=f"(after {next_snapshot_at:,} games)")
-            print(f"\n{opponent_pool.get_pool_info()}")
+            
+            # Verify the checkpoint was actually saved
+            if not latest_path.exists():
+                print(f"❌ ERROR: Checkpoint not saved at {latest_path}")
+                print(f"   Check that {latest_path.parent} is writable")
+            else:
+                print(f"✓ Checkpoint saved: {latest_path}")
+                print(f"  File size: {latest_path.stat().st_size / 1024:.1f} KB")
+            
+            # Gate snapshot addition: only add if reasonably competent
+            print(f"\n🔍 Checking competence before adding to pool...")
+            agent_instance.set_eval_mode(True)
+            wr_vs_random = evaluate(agent_instance, randomAgent, n_eval=40, 
+                                   label="vs random (gate check)", debug_sides=False, 
+                                   use_lookahead=False)
+            agent_instance.set_eval_mode(False)
+            
+            min_competence = 60.0  # Minimum win rate vs random to add to pool
+            if wr_vs_random >= min_competence:
+                print(f"✓ Snapshot meets competence threshold ({wr_vs_random:.1f}% ≥ {min_competence}%)")
+                opponent_pool.add_snapshot(latest_path, label=f"(after {next_snapshot_at:,} games, WR={wr_vs_random:.0f}%)")
+                print(f"\n{opponent_pool.get_pool_info()}")
+            else:
+                print(f"❌ Snapshot rejected ({wr_vs_random:.1f}% < {min_competence}%)")
+                print(f"   Not adding to pool to avoid polluting curriculum")
+            
+            # Verify pool can actually load snapshots
+            if len(opponent_pool) > 0 and games_done == next_snapshot_at:  # First snapshot
+                print("\n🔍 Testing pool loading...")
+                test_opp = opponent_pool.sample_opponent(bias_recent=True)
+                if test_opp is not None:
+                    print(f"✓ Successfully loaded opponent from pool!")
+                    print(f"  Opponent steps: {test_opp.steps if hasattr(test_opp, 'steps') else 'N/A'}")
+                else:
+                    print(f"❌ WARNING: Could not load opponent from pool")
+                    print(f"   Pool will not be used in training!")
+            
+            print(f"{'='*60}\n")
             next_snapshot_at += pool_snapshot_every  # schedule next threshold
 
         # Evaluate by threshold (used to be if (g % n_epochs) == 0)
@@ -709,6 +963,13 @@ def train(n_games=200_000,
                 wr_rand = evaluate(agent_instance, randomAgent, max(50, n_eval // 2),
                                 label="vs random", debug_sides=True, use_lookahead=False)
                 perf_data['vs_random'].append(wr_rand)
+                
+                # Track and save best checkpoint
+                if wr_rand > best_wr_vs_random:
+                    best_wr_vs_random = wr_rand
+                    agent_instance.save(str(best_ckpt_path))
+                    print(f"  🌟 NEW BEST vs random: {wr_rand:.1f}% (saved to {best_ckpt_path.name})")
+                
                 if wr_rand < 50.0:
                     print(f"  ⚠️  WARNING: Only {wr_rand:.1f}% vs random!")
             except Exception as e:
@@ -786,14 +1047,19 @@ if __name__ == "__main__":
         print("=" * 70 + "\n")
         
         train(
-            n_games=10_000,
-            n_epochs=1_000,
-            n_eval=50,  # Fewer eval games for speed
-            eval_vs="pubeval",  # Still measure vs pubeval!
+            n_games=50_000,  # Increased from 10k to give time to stabilize
+            n_epochs=5_000,
+            n_eval=200,  # More eval games for confidence
+            eval_vs="pubeval",
             model_size='small',
-            use_eval_lookahead=False,  # Disable for speed
-            pool_snapshot_every=2_000,
-            league_checkpoint_every=5_000,
+            use_opponent_pool=False,  # DISABLED - build competence first!
+            pool_snapshot_every=5_000,
+            pubeval_sample_rate=0.20,  # 20% pubeval exposure
+            random_sample_rate=0.20,   # 20% random for robustness
+            use_eval_lookahead=True,
+            eval_lookahead_k=3,
+            use_bc_warmstart=True,  # NEW: Jump-start with pubeval imitation
+            league_checkpoint_every=10_000,
         )
     else:
         train(

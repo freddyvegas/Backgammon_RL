@@ -22,7 +22,7 @@ np.random.seed(42)
 # ---------------- Config ----------------
 class Config:
     """Base configuration class."""
-    state_dim = 30  # 29 board positions + 1 moves_left counter
+    state_dim = 29  # 29 board positions (moves_left feature removed)
     max_actions = 64  # For padding, not actual head size
     
     # PPO hyperparameters
@@ -48,19 +48,24 @@ class Config:
     model_dim = 512  # Width of ResMLP
     n_blocks = 6  # Number of residual blocks
     
-    # Gradient clipping
-    grad_clip = 0.5
-    max_grad_norm = 0.5
+    # Gradient clipping (for stability)
+    grad_clip = 0.5              # Reduced from 1.0
+    max_grad_norm = 0.5          # Reduced from 1.0
     
     # Weight decay for regularization
     weight_decay = 1e-5
     
-    # Reward shaping (KEEP SMALL to avoid swamping terminal reward!)
-    use_reward_shaping = True
-    pip_reward_scale = 0.01  # Pip count improvement (normalized)
-    bear_off_reward = 0.05   # Per checker borne off
-    hit_reward = 0.02        # Per hit (currently unused)
-    shaping_clip = 0.1       # Clip total shaping per step to ±this value
+    # Reward scaling - reduced to 1.0 for stability
+    reward_scale = 1.0  # Reduced from 10.0 to avoid exploding gradients
+    
+    # Reward shaping (DISABLED - causes bad strategy learning!)
+    # With shaping ON: Agent learns to make "progressive" moves that lose
+    # With shaping OFF: Agent learns from wins/losses only (slower but correct)
+    use_reward_shaping = False
+    pip_reward_scale = 0.001  # If enabled, keep tiny
+    bear_off_reward = 0.01    # If enabled, keep small
+    hit_reward = 0.01
+    shaping_clip = 0.05
 
 
 class SmallConfig(Config):
@@ -80,7 +85,10 @@ class SmallConfig(Config):
     n_blocks = 3         # 6 → 3 (half the depth)
     rollout_length = 256 # 512 → 256 (faster updates)
     minibatch_size = 64  # 128 → 64 (fits in memory better)
-    lr = 2e-4            # Slightly higher LR for faster learning
+    lr = 1e-4            # Lower for stability
+    
+    # Reward shaping DISABLED for correct learning
+    use_reward_shaping = False
 
 
 class MediumConfig(Config):
@@ -440,10 +448,10 @@ class PPOAgent:
         else:
             self.acnet.train()
     
-    def _encode_state(self, board, moves_left):
-        """Encode board state with move counter."""
-        state = np.concatenate([board, [moves_left / 4.0]])
-        return state.astype(np.float32)
+    def _encode_state(self, board, moves_left=None):
+        """Encode board state (29 dims only, moves_left removed)."""
+        # moves_left parameter kept for backward compatibility but not used
+        return board.astype(np.float32)
     
     def _compute_shaped_reward(self, old_board, new_board):
         """Compute auxiliary reward shaping (SMALL values only!)."""
@@ -494,12 +502,50 @@ class PPOAgent:
         torch.save(checkpoint, path)
     
     def load(self, path: str, map_location: Union[str, torch.device] = None):
-        """Load agent checkpoint with proper device handling."""
+        """Load agent checkpoint with proper device handling and architecture matching."""
         if map_location is None:
             map_location = self.device
         
         checkpoint = torch.load(path, map_location=map_location, weights_only=False)
         
+        # --- NEW: Rebuild to checkpoint's architecture if needed ---
+        ck_cfg = checkpoint.get("config", {})
+        need_rebuild = (
+            ck_cfg.get("state_dim", self.config.state_dim) != self.config.state_dim or
+            ck_cfg.get("model_dim", self.config.model_dim) != self.config.model_dim or
+            ck_cfg.get("n_blocks", self.config.n_blocks) != self.config.n_blocks
+        )
+        
+        if need_rebuild:
+            old_state = f"dim={self.config.model_dim}, blocks={self.config.n_blocks}"
+            new_state = f"dim={ck_cfg.get('model_dim', self.config.model_dim)}, blocks={ck_cfg.get('n_blocks', self.config.n_blocks)}"
+            print(f"[PPOAgent] Architecture mismatch detected!")
+            print(f"  Current: {old_state}")
+            print(f"  Checkpoint: {new_state}")
+            print(f"  Rebuilding network to match checkpoint...")
+            
+            # Update config to match checkpoint
+            self.config.state_dim = ck_cfg.get("state_dim", self.config.state_dim)
+            self.config.model_dim = ck_cfg.get("model_dim", self.config.model_dim)
+            self.config.n_blocks = ck_cfg.get("n_blocks", self.config.n_blocks)
+            
+            # Rebuild network on the same device (using correct class name: ACNet)
+            self.acnet = ACNet(
+                in_dim=self.config.state_dim,
+                d=self.config.model_dim,
+                n_blocks=self.config.n_blocks
+            ).to(self.device)
+            
+            # Rebuild optimizer
+            self.optimizer = torch.optim.Adam(
+                self.acnet.parameters(),
+                lr=self.config.lr,
+                weight_decay=self.config.weight_decay
+            )
+            
+            print(f"  ✓ Network rebuilt successfully")
+        
+        # Load state dicts
         self.acnet.load_state_dict(checkpoint["acnet"])
         self.optimizer.load_state_dict(checkpoint["optimizer"])
         self.steps = checkpoint.get("steps", 0)
@@ -507,7 +553,9 @@ class PPOAgent:
         self.current_entropy_coef = checkpoint.get("current_entropy_coef", self.config.entropy_coef)
         
         print(f"[PPOAgent] Loaded checkpoint from {path}")
+        print(f"  Architecture: dim={self.config.model_dim}, blocks={self.config.n_blocks}")
         print(f"  Steps: {self.steps}, Updates: {self.updates}")
+
 
     def batch_score(self, states_np, cand_states_np, masks_np):
         """
@@ -617,8 +665,21 @@ class PPOAgent:
                 surr2 = torch.clamp(ratio, 1 - self.config.clip_epsilon, 1 + self.config.clip_epsilon) * b_advantages
                 policy_loss = -torch.min(surr1, surr2).mean()
                 
-                # Value loss
-                value_loss = F.mse_loss(new_values, b_returns)
+                # Value loss with clipping (standard PPO trick)
+                # Get old value predictions from buffer
+                b_old_values = values[batch_indices]
+                
+                # Clip value predictions
+                value_pred_clipped = b_old_values + (new_values - b_old_values).clamp(
+                    -self.config.clip_epsilon, self.config.clip_epsilon
+                )
+                
+                # Compute both clipped and unclipped losses
+                v_loss_unclipped = F.mse_loss(new_values, b_returns)
+                v_loss_clipped = F.mse_loss(value_pred_clipped, b_returns)
+                
+                # Take the maximum (more conservative)
+                value_loss = torch.max(v_loss_unclipped, v_loss_clipped)
                 
                 # Entropy bonus (use finite log to avoid NaN)
                 log_probs_finite = torch.log(probs + 1e-12)  # Strictly finite
