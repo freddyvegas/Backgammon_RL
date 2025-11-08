@@ -48,7 +48,7 @@ if torch.cuda.is_available():
 
 # Local checkpoint directory (no Google Drive)
 CHECKPOINT_DIR = "./checkpoints"
-BATCH_SIZE = 8  # or 16/32 for more parallel games
+BATCH_SIZE = 32  # or 16/32 for more parallel games
 
 print(f"Batch self-play games: {BATCH_SIZE} games in parallel")
 
@@ -275,7 +275,7 @@ def play_games_batched(agent_obj, opponent, batch_size=8, training=True):
                     value = values[row].item() if hasattr(values[row], 'item') else float(values[row])
                     
                     # DEBUG: Track before incrementing
-                    old_steps = agent_obj.steps
+                    #old_steps = agent_obj.steps
                     
                     # Push transition to buffer
                     agent_obj.buffer.push(
@@ -286,22 +286,26 @@ def play_games_batched(agent_obj, opponent, batch_size=8, training=True):
                     agent_obj.steps += 1
                     
                     # DEBUG: Print every 100 steps
-                    if agent_obj.steps % 100 == 0 or agent_obj.steps <= 10:
-                        print(f"    [TRAIN] Game env {idx}: steps {old_steps}→{agent_obj.steps}, "
-                              f"buffer {agent_obj.buffer.size}/{agent_obj.config.rollout_length}, "
-                              f"updates {agent_obj.updates}, reward {reward:.3f}")
+                    #if agent_obj.steps % 100 == 0 or agent_obj.steps <= 10:
+                        #print(f"    [TRAIN] Game env {idx}: steps {old_steps}→{agent_obj.steps}, "
+                              #f"buffer {agent_obj.buffer.size}/{agent_obj.config.rollout_length}, "
+                              #f"updates {agent_obj.updates}, reward {reward:.3f}")
                     
                     # Trigger PPO update if buffer is full
                     if agent_obj.buffer.is_ready():
-                        print(f"    [UPDATE] Buffer full! Triggering PPO update #{agent_obj.updates + 1}")
+                        #print(f"    [UPDATE] Buffer full! Triggering PPO update #{agent_obj.updates + 1}")
                         agent_obj._ppo_update()
-                        print(f"    [UPDATE] Done! Steps={agent_obj.steps}, Updates={agent_obj.updates}")
+                        #print(f"    [UPDATE] Done! Steps={agent_obj.steps}, Updates={agent_obj.updates}")
                 
                 # Check if game over
                 done = backgammon.game_over(boards[idx])
                 if done:
                     env_active[idx] = False
                     finished += 1
+                    # DEBUG: Print who won
+                    #agent_won = boards[idx][27] == 15
+                    #opp_won = boards[idx][28] == -15
+                    #print(f"    [GAME OVER] Env {idx}: Agent pieces borne off={boards[idx][27]}, Opp pieces={boards[idx][28]}, Agent won={agent_won}, Opp won={opp_won}")
                 else:
                     # FIX #4: Decrement passes
                     passes_left[idx] -= 1
@@ -337,10 +341,16 @@ def play_games_batched(agent_obj, opponent, batch_size=8, training=True):
                 env_active[idx] = False
                 finished += 1
                 
+                # DEBUG: Print who won
+                #agent_won = boards[idx][27] == 15
+                #opp_won = boards[idx][28] == -15
+                #print(f"    [GAME OVER] Env {idx}: Agent pieces borne off={boards[idx][27]}, Opp pieces={boards[idx][28]}, Agent won={agent_won}, Opp won={opp_won}")
+                
                 # FIX #3: Store a loss transition when opponent wins
                 if training and not agent_obj.eval_mode:
                     # Check if opponent actually won (agent lost)
                     if boards[idx][28] == -15:
+                        #print(f"    [LOSS DETECTED] Env {idx}: Opponent won, creating loss transition")
                         # Create a terminal loss transition for the final state
                         # Use the current board state (after opponent's winning move)
                         board_pov = flip_to_pov_plus1(boards[idx], 1)
@@ -352,22 +362,26 @@ def play_games_batched(agent_obj, opponent, batch_size=8, training=True):
                         mask = np.zeros(agent_obj.config.max_actions, dtype=np.float32)
                         mask[0] = 1.0
                         
+                        # Calculate reward
+                        loss_reward = -1.0 * agent_obj.config.reward_scale
+                        #print(f"    [LOSS REWARD] Env {idx}: Storing reward={loss_reward:.3f} (reward_scale={agent_obj.config.reward_scale})")
+                        
                         # Push terminal loss transition
                         agent_obj.buffer.push(
                             S, cand_states, mask,
                             0,  # action index
                             0.0,  # log_prob
                             0.0,  # value (terminal state)
-                            -1.0 * agent_obj.config.reward_scale,  # negative reward
+                            loss_reward,  # negative reward
                             1.0  # done=True
                         )
                         agent_obj.steps += 1
                         
                         # Trigger PPO update if buffer is full
                         if agent_obj.buffer.is_ready():
-                            print(f"    [UPDATE] Buffer full after loss! Triggering PPO update #{agent_obj.updates + 1}")
+                            #print(f"    [UPDATE] Buffer full after loss! Triggering PPO update #{agent_obj.updates + 1}")
                             agent_obj._ppo_update()
-                            print(f"    [UPDATE] Done! Steps={agent_obj.steps}, Updates={agent_obj.updates}")
+                            #print(f"    [UPDATE] Done! Steps={agent_obj.steps}, Updates={agent_obj.updates}")
             else:
                 # FIX #4: Decrement passes
                 passes_left[idx] -= 1
@@ -736,9 +750,9 @@ def train(n_games=200_000,
     cfg.entropy_min = 0.01  # Keep exploration alive longer
     
     # FIX #7: Device selection consistency - use CPU for stability
-    device = 'cpu'
-    print(f"\n⚠️  USING CPU DEVICE (for PPO stability)")
-    print(f"   Expected: 2-3x slower than MPS/GPU, but more stable training\n")
+    device = agent.get_device()
+    #print(f"\n⚠️  USING CPU DEVICE (for PPO stability)")
+    #print(f"   Expected: 2-3x slower than MPS/GPU, but more stable training\n")
     
     agent_instance = agent.PPOAgent(config=cfg, device=device)
     
@@ -822,14 +836,14 @@ def train(n_games=200_000,
     games_done = 0
     
     # DEBUG: Initial state
-    print(f"\n[DEBUG] Initial agent state:")
-    print(f"  steps: {agent_instance.steps}")
-    print(f"  updates: {agent_instance.updates}")
-    print(f"  buffer size: {agent_instance.buffer.size}")
-    print(f"  rollout_length: {agent_instance.config.rollout_length}")
-    print(f"  eval_mode: {agent_instance.eval_mode}")
-    print(f"  Training: {not agent_instance.eval_mode}")
-    print()
+    #print(f"\n[DEBUG] Initial agent state:")
+    #print(f"  steps: {agent_instance.steps}")
+    #print(f"  updates: {agent_instance.updates}")
+    #print(f"  buffer size: {agent_instance.buffer.size}")
+    #print(f"  rollout_length: {agent_instance.config.rollout_length}")
+    #print(f"  eval_mode: {agent_instance.eval_mode}")
+    #print(f"  Training: {not agent_instance.eval_mode}")
+    #print()
 
     # Schedule thresholds (not modulo-based anymore)
     next_eval_at = n_epochs
@@ -901,9 +915,9 @@ def train(n_games=200_000,
                 opponent_type = 'pool' if opponent is not None else 'self_play'
             
             # Debug: Log pool usage occasionally
-            if games_done % 1000 == 0 and opponent_type != 'self_play':
-                ramp_pct = effective_pool_rate * 100
-                print(f"  [Pool] Sampling at {ramp_pct:.1f}% rate (target: {pool_target_rate*100:.0f}%)")
+            #if games_done % 1000 == 0 and opponent_type != 'self_play':
+            #    ramp_pct = effective_pool_rate * 100
+            #    print(f"  [Pool] Sampling at {ramp_pct:.1f}% rate (target: {pool_target_rate*100:.0f}%)")
         elif r < effective_pool_rate + pubeval_sample_rate:
             opponent = pubeval
             opponent_type = 'pubeval'
@@ -928,15 +942,15 @@ def train(n_games=200_000,
         opponent_stats[opponent_type] += finished
         
         # DEBUG: After first batch
-        if games_done == BATCH_SIZE:
-            print(f"\n[DEBUG] After first batch ({BATCH_SIZE} games):")
-            print(f"  steps: {agent_instance.steps} (expected ~{BATCH_SIZE * 30})")
-            print(f"  updates: {agent_instance.updates}")
-            print(f"  buffer size: {agent_instance.buffer.size}")
-            if agent_instance.steps == 0:
-                print(f"  ⚠️  WARNING: No steps after {BATCH_SIZE} games!")
-                print(f"  ⚠️  This means agent moves are not being recorded!")
-            print()
+        #if games_done == BATCH_SIZE:
+            #print(f"\n[DEBUG] After first batch ({BATCH_SIZE} games):")
+            #print(f"  steps: {agent_instance.steps} (expected ~{BATCH_SIZE * 30})")
+            #print(f"  updates: {agent_instance.updates}")
+            #print(f"  buffer size: {agent_instance.buffer.size}")
+            #if agent_instance.steps == 0:
+            #    print(f"  ⚠️  WARNING: No steps after {BATCH_SIZE} games!")
+            #    print(f"  ⚠️  This means agent moves are not being recorded!")
+            #print()
 
         # Update bar postfix periodically
         if games_done % 100 == 0 or games_done == n_games:
@@ -1017,20 +1031,20 @@ def train(n_games=200_000,
 
             wr = evaluate(agent_instance, baseline, n_eval,
                         label=f"vs {eval_vs} (greedy)",
-                        debug_sides=True, use_lookahead=False)
+                        debug_sides=False, use_lookahead=False)
             perf_data['vs_baseline'].append(wr)
 
             if use_eval_lookahead:
                 wr_lookahead = evaluate(agent_instance, baseline, min(100, n_eval),
                                         label=f"vs {eval_vs}",
-                                        debug_sides=True, use_lookahead=True,
+                                        debug_sides=False, use_lookahead=True,
                                         lookahead_k=eval_lookahead_k)
                 perf_data['vs_baseline_lookahead'].append(wr_lookahead)
                 print(f"  Lookahead improvement: +{(wr_lookahead - wr):.1f}% points")
 
             try:
                 wr_rand = evaluate(agent_instance, randomAgent, max(50, n_eval // 2),
-                                label="vs random", debug_sides=True, use_lookahead=False)
+                                label="vs random", debug_sides=False, use_lookahead=False)
                 perf_data['vs_random'].append(wr_rand)
                 
                 # Track and save best checkpoint
@@ -1115,31 +1129,22 @@ if __name__ == "__main__":
         print("  Baseline: pubeval")
         print("  Lookahead: enabled")
         print("=" * 70 + "\n")
-
-        train(
-        n_games=10_000,
-        n_epochs=1_000,
-        model_size='small',
-        use_opponent_pool=False,     # Disable
-        pubeval_sample_rate=0.0,     # Disable
-        random_sample_rate=1.0,      # Only random
-        )
         
-        #train(
-        #    n_games=50_000,
-        #    n_epochs=5_000,
-        #    n_eval=200,
-        #    eval_vs="pubeval",
-        #    model_size='small',
-        #    use_opponent_pool=False,  # DISABLED - build competence first!
-        #    pool_snapshot_every=5_000,
-        #    pubeval_sample_rate=0.20,  # 20% pubeval exposure
-        #    random_sample_rate=0.20,   # 20% random for robustness
-        #    use_eval_lookahead=True,
-        #    eval_lookahead_k=3,
-        #    use_bc_warmstart=True,  # Jump-start with pubeval imitation
-        #    league_checkpoint_every=10_000,
-        #)
+        train(
+            n_games=50_000,
+            n_epochs=5_000,
+            n_eval=200,
+            eval_vs="pubeval",
+            model_size='small',
+            use_opponent_pool=False,  # DISABLED - build competence first!
+            pool_snapshot_every=5_000,
+            pubeval_sample_rate=0.20,  # 20% pubeval exposure
+            random_sample_rate=0.20,   # 20% random for robustness
+            use_eval_lookahead=True,
+            eval_lookahead_k=3,
+            use_bc_warmstart=True,  # Jump-start with pubeval imitation
+            league_checkpoint_every=10_000,
+        )
     else:
         train(
             n_games=args.n_games,

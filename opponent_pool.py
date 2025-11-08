@@ -150,7 +150,6 @@ class OpponentPool:
                 try:
                     opponent = agent_mod.PPOAgent(device=self.device)
                 except TypeError:
-                    # Fallback: create without device, will use default
                     opponent = agent_mod.PPOAgent()
 
                 # Load weights into this instance
@@ -191,7 +190,7 @@ class OpponentPool:
         for snapshot_path, snapshot_id in self.snapshots:
             try:
                 # Try to load checkpoint metadata
-                checkpoint = torch.load(snapshot_path, map_location='cpu', weights_only=False)
+                checkpoint = torch.load(snapshot_path, map_location='cpu')
                 has_weights = "acnet" in checkpoint
                 has_steps = "steps" in checkpoint
                 steps = checkpoint.get("steps", 0)
@@ -218,7 +217,7 @@ class OpponentPool:
         
         for snapshot_path, snapshot_id in self.snapshots:
             try:
-                checkpoint = torch.load(snapshot_path, map_location='cpu', weights_only=False)
+                checkpoint = torch.load(snapshot_path, map_location='cpu')
                 if "acnet" in checkpoint:
                     valid_snapshots.append((snapshot_path, snapshot_id))
                 else:

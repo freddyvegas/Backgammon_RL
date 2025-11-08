@@ -37,7 +37,7 @@ class Config:
     max_actions = 64
     
     # PPO hyperparameters - GENTLER for stability
-    lr = 5e-5
+    lr = 5e-5              # Reduced from 1e-4 → 5e-5
     gamma = 0.99
     gae_lambda = 0.95
     clip_epsilon = 0.1     # Reduced from 0.2 → 0.1
@@ -89,13 +89,10 @@ class SmallConfig(Config):
     n_blocks = 3
     rollout_length = 256
     minibatch_size = 64
-    lr = 2e-4  # Gentler
-    ppo_epochs = 4  # Gentler
-    clip_epsilon = 0.2     # Less conservative
-    entropy_coef = 0.05    # More exploration
-    entropy_min = 0.01     # Don't collapse
-    use_reward_shaping = False,
-    teacher_sample_rate = 0.0
+    lr = 5e-5  # Gentler
+    ppo_epochs = 2  # Gentler
+    clip_epsilon = 0.1  # Gentler
+    use_reward_shaping = False
 
 
 class MediumConfig(Config):
@@ -574,9 +571,23 @@ class PPOAgent:
         # Get buffered data
         states, cand_states, masks, actions, old_log_probs, values, rewards, dones, teacher_indices = self.buffer.get()
         
+        # DEBUG: Print reward statistics
+        #n_positive = (rewards > 0.5).sum()
+        #n_negative = (rewards < -0.5).sum()
+        #n_zero = ((rewards >= -0.5) & (rewards <= 0.5)).sum()
+        #print(f"  [PPO DEBUG] Buffer rewards: +1={n_positive}, -1={n_negative}, ~0={n_zero}, mean={rewards.mean():.3f}, min={rewards.min():.3f}, max={rewards.max():.3f}")
+        
         # Compute advantages and returns
         advantages, returns = self._compute_gae(rewards, values, dones)
+        
+        # Normalize advantages
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        
+        # CRITICAL: Clip advantages to prevent extreme values
+        # Extreme advantages cause unstable training
+        # REMOVED: hard clipping of advantages
+        
+        #print(f"  [PPO DEBUG] Advantages: mean={advantages.mean():.3f}, std={advantages.std():.3f}, range=[{advantages.min():.3f}, {advantages.max():.3f}]")
         
         # Convert to tensors
         states_t = torch.as_tensor(states, dtype=torch.float32, device=self.device)
@@ -586,6 +597,8 @@ class PPOAgent:
         old_log_probs_t = torch.as_tensor(old_log_probs, dtype=torch.float32, device=self.device)
         advantages_t = torch.as_tensor(advantages, dtype=torch.float32, device=self.device)
         returns_t = torch.as_tensor(returns, dtype=torch.float32, device=self.device)
+        old_values_t = torch.as_tensor(values, dtype=torch.float32, device=self.device)  # for clipped value loss
+
         teacher_indices_t = torch.as_tensor(teacher_indices, dtype=torch.int64, device=self.device)  # NEW
         
         # Compute deltas
@@ -621,10 +634,11 @@ class PPOAgent:
                 mb_old_log_probs = old_log_probs_t[mb_indices]
                 mb_advantages = advantages_t[mb_indices]
                 mb_returns = returns_t[mb_indices]
+                mb_old_values = old_values_t[mb_indices]
                 mb_teacher_idx = teacher_indices_t[mb_indices]
                 
                 # Forward pass
-                logits, values = self.acnet(mb_states, mb_deltas, mb_masks)
+                logits, value_preds = self.acnet(mb_states, mb_deltas, mb_masks)
                 
                 # Compute log probs
                 log_probs_all = F.log_softmax(logits.masked_fill(mb_masks == 0, -1e9), dim=-1)
@@ -632,13 +646,33 @@ class PPOAgent:
                 
                 # PPO policy loss
                 ratio = torch.exp(log_probs - mb_old_log_probs)
+                
+                # CRITICAL FIX: Clamp ratio to prevent extreme ratios
+                ratio = torch.clamp(ratio, 0.5, 2.0)
+                
                 surr1 = ratio * mb_advantages
                 surr2 = torch.clamp(ratio, 1.0 - self.config.clip_epsilon, 1.0 + self.config.clip_epsilon) * mb_advantages
                 policy_loss = -torch.min(surr1, surr2).mean()
                 
-                # Value loss with clipping
-                value_pred_clipped = values
-                value_loss = F.mse_loss(value_pred_clipped, mb_returns)
+                # CRITICAL: Clamp policy loss to prevent negative values
+                # Negative policy loss = gradient ascent on bad actions!
+                #if policy_loss.item() < -1e-6:
+                #    print(f"    [WARNING] Negative policy loss: {policy_loss.item():.4f}")
+                #    print(f"      ratio: [{ratio.min().item():.3f}, {ratio.max().item():.3f}]")
+                #    print(f"      advantages: [{mb_advantages.min().item():.3f}, {mb_advantages.max().item():.3f}]")
+                #    print(f"      surr1: [{surr1.min().item():.3f}, {surr1.max().item():.3f}]")
+                #    print(f"      surr2: [{surr2.min().item():.3f}, {surr2.max().item():.3f}]")
+                
+                 # Value loss with clipping (PPO)
+                # v_t: current value preds; v_t_old: baseline from buffer
+                v_t = value_preds.squeeze(-1) if value_preds.dim() > 1 else value_preds
+                v_t_old = mb_old_values.squeeze(-1) if mb_old_values.dim() > 1 else mb_old_values
+                v_t_clipped = v_t_old + torch.clamp(v_t - v_t_old,
+                                                 -self.config.clip_epsilon,
+                                                  self.config.clip_epsilon)
+                value_loss_unclipped = (v_t - mb_returns).pow(2)
+                value_loss_clipped  = (v_t_clipped - mb_returns).pow(2)
+                value_loss = 0.5 * torch.max(value_loss_unclipped, value_loss_clipped).mean()
                 
                 # Entropy bonus
                 probs = F.softmax(logits.masked_fill(mb_masks == 0, -1e9), dim=-1)
@@ -727,12 +761,22 @@ class PPOAgent:
                 S = self._encode_state(board_pov, moves_left)
                 cand_states = np.array([self._encode_state(chosen_board, moves_left - 1)])
                 mask = np.ones(1, dtype=np.float32)
-                
+
                 pad_size = self.config.max_actions - 1
                 cand_padded = np.pad(cand_states, ((0, pad_size), (0, 0)), mode='constant')
                 mask_padded = np.pad(mask, (0, pad_size), mode='constant')
-                
-                self.buffer.push(S, cand_padded, mask_padded, 0, 0.0, 0.0, total_reward, done, -1)
+
+                # Compute true log-prob and value for the single action
+                S_t = torch.as_tensor(S, dtype=torch.float32, device=self.device).unsqueeze(0)
+                deltas_t = torch.as_tensor(cand_padded, dtype=torch.float32, device=self.device).unsqueeze(0)
+                mask_t = torch.as_tensor(mask_padded, dtype=torch.float32, device=self.device).unsqueeze(0)
+                with torch.no_grad():
+                    logits_sa, value_sa = self.acnet(S_t, deltas_t, mask_t)
+                    log_probs_sa = F.log_softmax(logits_sa.masked_fill(mask_t == 0, -1e9), dim=-1)
+                    log_prob_single = log_probs_sa[0, 0].item()
+                    value_single = (value_sa.squeeze(-1)[0].item() if value_sa.dim() > 1 else value_sa[0].item())
+
+                self.buffer.push(S, cand_padded, mask_padded, 0, log_prob_single, value_single, total_reward, done, -1)
                 self.steps += 1
                 if self.buffer.is_ready():
                     self._ppo_update()
