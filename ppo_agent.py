@@ -603,8 +603,8 @@ class PPOAgent:
         self,
         batch_iter,
         epochs: int = 1,
-        assume_second_roll: bool | np.ndarray = False,
-        lr: float | None = None,
+        assume_second_roll = False,
+        lr = None,
         grad_clip: float = 1.0,
     ):
         """

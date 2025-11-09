@@ -49,7 +49,7 @@ if torch.cuda.is_available():
 
 # Local checkpoint directory (no Google Drive)
 CHECKPOINT_DIR = "./checkpoints"
-BATCH_SIZE = 32  # or 16/32 for more parallel games
+BATCH_SIZE = 8  # or 16/32 for more parallel games
 
 print(f"Batch self-play games: {BATCH_SIZE} games in parallel")
 
@@ -1036,7 +1036,7 @@ if __name__ == "__main__":
             random_sample_rate=0.20,   # 20% random for robustness
             use_eval_lookahead=True,
             eval_lookahead_k=3,
-            use_bc_warmstart=True,  # Jump-start with pubeval imitation
+            use_bc_warmstart=False,  # Jump-start with pubeval imitation
             league_checkpoint_every=10_000,
         )
     else:
@@ -1054,6 +1054,6 @@ if __name__ == "__main__":
             pubeval_sample_rate=0.45,   # 45% pubeval (strong baseline)
             random_sample_rate=0.05,    # 5% random (robustness only)
             # Evaluation
-            use_eval_lookahead=True,
+            use_eval_lookahead=False,
             eval_lookahead_k=3,
         )
