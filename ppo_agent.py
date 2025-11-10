@@ -407,19 +407,15 @@ class PPOAgent:
             }
         }, path)
 
-    def load(self, path: str, map_location: Union[str, torch.device] = None):
+    def load(self, path: str, map_location: Union[str, torch.device] = None, load_optimizer: bool = True):
         """
         Load agent checkpoint.
-
-        FIX #12: Removed weights_only parameter for PyTorch version compatibility
         """
         if map_location is None:
             map_location = self.device
 
-        # FIX #12: Removed weights_only=False parameter
         checkpoint = torch.load(path, map_location=map_location)
 
-        # FIX #1: Rebuild network with correct architecture from checkpoint
         saved_config = checkpoint.get('config', {})
         if saved_config:
             # Recreate network if architecture differs
@@ -432,7 +428,6 @@ class PPOAgent:
                 print(f"    model_dim={saved_config.get('model_dim', self.config.model_dim)}")
                 print(f"    n_blocks={saved_config.get('n_blocks', self.config.n_blocks)}")
 
-                # FIX #1: Use correct keyword argument names
                 self.acnet = PPOActorCritic(
                     state_dim=saved_config.get('state_dim', self.config.state_dim),
                     model_dim=saved_config.get('model_dim', self.config.model_dim),
@@ -440,7 +435,8 @@ class PPOAgent:
                 ).to(self.device)
 
         self.acnet.load_state_dict(checkpoint['acnet'])
-        self.optimizer.load_state_dict(checkpoint['optimizer'])
+        if load_optimizer:
+            self.optimizer.load_state_dict(checkpoint['optimizer'])
         self.steps = checkpoint.get('steps', 0)
         self.updates = checkpoint.get('updates', 0)
         self.current_entropy_coef = checkpoint.get('entropy_coef', self.config.entropy_coef)

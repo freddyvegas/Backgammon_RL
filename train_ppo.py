@@ -276,7 +276,7 @@ def train_step(state: TrainingState, train_bar: tqdm):
             try:
                 agent_mod = importlib.import_module("ppo_agent")
                 opponent = agent_mod.PPOAgent(device=state.device)
-                opponent.load(str(state.best_ckpt_path), map_location=state.device)
+                opponent.load(str(state.best_ckpt_path), map_location=state.device, load_optimizer=False)
                 opponent.set_eval_mode(True)
                 opponent_type = 'pool_best'
             except Exception:
