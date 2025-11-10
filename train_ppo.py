@@ -396,7 +396,7 @@ def validation_step(state: TrainingState):
         if wr > state.best_wr:
             state.best_wr = wr
             ai.save(str(state.best_ckpt_path))
-            print(f"  🌟 NEW BEST vs random: {wr:.1f}% (saved to {state.best_ckpt_path.name})")
+            print(f"  🌟 NEW BEST vs pubeval: {wr:.1f}% (saved to {state.best_ckpt_path.name})")
 
         if state.use_eval_lookahead:
             wr_lookahead = evaluate(ai, state.baseline, min(100, state.n_eval),
