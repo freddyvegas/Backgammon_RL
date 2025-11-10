@@ -555,8 +555,8 @@ if __name__ == "__main__":
             use_opponent_pool=True,
             pool_snapshot_every=5_000,
             pool_max_size=12,
-            pool_sample_rate=0.90,      # 50% pool (self-play curriculum)
-            pubeval_sample_rate=0.10,   # 45% pubeval (strong baseline)
+            pool_sample_rate=0.90,      # 90% pool (self-play curriculum)
+            pubeval_sample_rate=0.10,   # 10% pubeval (strong baseline)
             random_sample_rate=0.00,    # 0% random (robustness only)
             use_eval_lookahead=False,
             eval_lookahead_k=3,

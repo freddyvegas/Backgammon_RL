@@ -153,7 +153,7 @@ class OpponentPool:
                     opponent = agent_mod.PPOAgent()
 
                 # Load weights into this instance
-                opponent.load(str(snapshot_path), map_location=self.device)
+                opponent.load(str(snapshot_path), map_location=self.device, load_optimizer=False)
                 
                 # Set eval mode
                 opponent.set_eval_mode(True)
