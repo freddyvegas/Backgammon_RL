@@ -30,7 +30,7 @@ import random_player as randomAgent
 import flipped_agent as flipped_util
 import ppo_agent as agent
 from opponent_pool import OpponentPool
-from utils import _ensure_dir, _safe_save_agent, plot_perf, _is_empty_move, _apply_move_sequence, flip_to_pov_plus1, get_device
+from utils import _ensure_dir, _safe_save_agent, plot_perf, _is_empty_move, _apply_move_sequence, flip_to_pov_plus1, flip_to_pov_plus1, get_device
 from play_games import play_games_batched
 from evaluate import evaluate, CheckpointLeague
 
@@ -560,5 +560,5 @@ if __name__ == "__main__":
             random_sample_rate=0.00,    # 0% random (robustness only)
             use_eval_lookahead=False,
             eval_lookahead_k=3,
-            device = get_device(),
+            device = 'cpu',
         )
