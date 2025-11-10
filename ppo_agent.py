@@ -22,13 +22,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 import random
-
+from utils import _flip_board, _flip_move, one_hot_encoding, get_device
 import backgammon
 
 # Set seeds for reproducibility
-torch.manual_seed(42)
-np.random.seed(42)
-random.seed(42)
+RANDOM_SEED = 42
+torch.manual_seed(RANDOM_SEED)
+np.random.seed(RANDOM_SEED)
+random.seed(RANDOM_SEED)
 
 # ---------------- Config ----------------
 class Config:
@@ -137,86 +138,12 @@ def get_config(size='large'):
 # Default config instance
 CFG = Config()
 
-
-def get_device():
-    """
-    Automatically detect and return the best available device.
-
-    FIX #7: Removed misleading MPS comments. MPS has known stability issues
-    with PPO training (negative policy loss, gradient explosion). Use CPU or CUDA.
-    """
-    if torch.cuda.is_available():
-        return "cuda"
-    elif torch.backends.mps.is_available():
-        return "mps"  # Available but use with caution for PPO
-    else:
-        return "cpu"
-
-
 # Set device at module level
 CFG.device = get_device()
 print(f"PPO agent using device: {CFG.device}")
 if CFG.device == "mps":
     print("  ⚠️  Note: MPS may have stability issues with PPO. Consider using CPU.")
 
-# -------------------- Features --------------------
-
-nx = 24 * 2 * 6 + 4 + 1  # = 293
-
-def one_hot_encoding(board29, nSecondRoll: bool):
-    """
-    board29: float/int array length 29 in +1 POV:
-      indices 1..24 = points (checkers for +1 positive, for -1 negative)
-      25,26,27,28    = +bar, -bar, +off, -off   (same indexing you use)
-      index 0 is ignored here (kept for compatibility with your 29-vector)
-    nSecondRoll: True on the first move of doubles, else False
-    returns: np.float32 shape (nx,)
-    """
-    oneHot = np.zeros(24 * 2 * 6 + 4 + 1, dtype=np.float32)
-    # +1 side bins
-    for i in range(0, 5):
-        idx = np.where(board29[1:25] == i)[0] - 1
-        if idx.size > 0:
-            oneHot[i*24 + idx] = 1
-    idx = np.where(board29[1:25] >= 5)[0] - 1
-    if idx.size > 0:
-        oneHot[5*24 + idx] = 1
-    # -1 side bins
-    for i in range(0, 5):
-        idx = np.where(board29[1:25] == -i)[0] - 1
-        if idx.size > 0:
-            oneHot[6*24 + i*24 + idx] = 1
-    idx = np.where(board29[1:25] <= -5)[0] - 1
-    if idx.size > 0:
-        oneHot[6*24 + 5*24 + idx] = 1
-    # bars/offs + second-roll flag
-    oneHot[12 * 24 + 0] = board29[25]
-    oneHot[12 * 24 + 1] = board29[26]
-    oneHot[12 * 24 + 2] = board29[27]
-    oneHot[12 * 24 + 3] = board29[28]
-    oneHot[12 * 24 + 4] = 1.0 if nSecondRoll else 0.0
-    return oneHot
-
-# ------------- Flip helpers -------------
-_FLIP_IDX = np.array(
-    [0, 24, 23, 22, 21, 20, 19, 18, 17, 16, 15, 14, 13,
-     12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 26, 25, 28, 27],
-    dtype=np.int32
-)
-
-def _flip_board(board):
-    out = np.empty(29, dtype=board.dtype)
-    out[:] = -board[_FLIP_IDX]
-    return out
-
-def _flip_move(move):
-    if len(move) == 0:
-        return move
-    mv = np.asarray(move, dtype=np.int32).copy()
-    for r in range(mv.shape[0]):
-        mv[r, 0] = _FLIP_IDX[mv[r, 0]]
-        mv[r, 1] = _FLIP_IDX[mv[r, 1]]
-    return mv
 
 # ------------- Rollout Buffer with Teacher Signal -------------
 class PPORolloutBuffer:
@@ -694,23 +621,11 @@ class PPOAgent:
         # Get buffered data
         states, cand_states, masks, actions, old_log_probs, values, rewards, dones, teacher_indices = self.buffer.get()
 
-        # DEBUG: Print reward statistics
-        #n_positive = (rewards > 0.5).sum()
-        #n_negative = (rewards < -0.5).sum()
-        #n_zero = ((rewards >= -0.5) & (rewards <= 0.5)).sum()
-        #print(f"  [PPO DEBUG] Buffer rewards: +1={n_positive}, -1={n_negative}, ~0={n_zero}, mean={rewards.mean():.3f}, min={rewards.min():.3f}, max={rewards.max():.3f}")
-
         # Compute advantages and returns
         advantages, returns = self._compute_gae(rewards, values, dones)
 
         # Normalize advantages
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-
-        # CRITICAL: Clip advantages to prevent extreme values
-        # Extreme advantages cause unstable training
-        # REMOVED: hard clipping of advantages
-
-        #print(f"  [PPO DEBUG] Advantages: mean={advantages.mean():.3f}, std={advantages.std():.3f}, range=[{advantages.min():.3f}, {advantages.max():.3f}]")
 
         # Convert to tensors
         states_t = torch.as_tensor(states, dtype=torch.float32, device=self.device)
@@ -777,16 +692,7 @@ class PPOAgent:
                 surr2 = torch.clamp(ratio, 1.0 - self.config.clip_epsilon, 1.0 + self.config.clip_epsilon) * mb_advantages
                 policy_loss = -torch.min(surr1, surr2).mean()
 
-                # CRITICAL: Clamp policy loss to prevent negative values
-                # Negative policy loss = gradient ascent on bad actions!
-                #if policy_loss.item() < -1e-6:
-                #    print(f"    [WARNING] Negative policy loss: {policy_loss.item():.4f}")
-                #    print(f"      ratio: [{ratio.min().item():.3f}, {ratio.max().item():.3f}]")
-                #    print(f"      advantages: [{mb_advantages.min().item():.3f}, {mb_advantages.max().item():.3f}]")
-                #    print(f"      surr1: [{surr1.min().item():.3f}, {surr1.max().item():.3f}]")
-                #    print(f"      surr2: [{surr2.min().item():.3f}, {surr2.max().item():.3f}]")
-
-                 # Value loss with clipping (PPO)
+                # Value loss with clipping (PPO)
                 # v_t: current value preds; v_t_old: baseline from buffer
                 v_t = value_preds.squeeze(-1) if value_preds.dim() > 1 else value_preds
                 v_t_old = mb_old_values.squeeze(-1) if mb_old_values.dim() > 1 else mb_old_values
