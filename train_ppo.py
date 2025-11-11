@@ -23,6 +23,7 @@ import torch.nn.functional as F
 import argparse
 import importlib
 from dataclasses import dataclass, field
+from datetime import datetime
 
 import backgammon
 import pubeval_player as pubeval
@@ -42,7 +43,7 @@ torch.manual_seed(RANDOM_SEED)
 if torch.cuda.is_available():
     torch.cuda.manual_seed_all(RANDOM_SEED)
 
-# Local checkpoint directory (no Google Drive)
+# Local checkpoint directory
 CHECKPOINT_DIR = "./checkpoints"
 BATCH_SIZE = 8  # or 16/32 for more parallel games
 
@@ -61,6 +62,7 @@ class TrainingState:
     n_games: int
     n_epochs: int
     n_eval: int
+    start_step: int
     use_opponent_pool: bool
     pool_snapshot_every: int
     pool_max_size: int
@@ -72,6 +74,7 @@ class TrainingState:
     use_bc_warmstart: bool
     league_checkpoint_every: int
     n_eval_league: int
+    timestamp: str
 
     # Curriculum tuning
     pool_start_games: int = 5_000
@@ -127,7 +130,8 @@ def initialize_training(
     use_bc_warmstart=False,
     league_checkpoint_every=20_000,
     n_eval_league=50,
-    device='cpu'
+    device='cpu',
+    resume=None
 ) -> TrainingState:
     print("\n" + "=" * 70)
     print("PPO TRAINING")
@@ -146,12 +150,17 @@ def initialize_training(
     cfg.ppo_epochs = 3
     cfg.entropy_min = 0.01
     agent_instance = agent.PPOAgent(config=cfg, device=device)
+    if resume is not None:
+       agent_instance.load(resume)
 
-    # Checkpoint paths
+    start_step = agent_instance.steps
+
+    # Checkpoint paths with time and date to avoid overwriting
     checkpoint_base_path = Path(CHECKPOINT_DIR)
     _ensure_dir(checkpoint_base_path)
-    agent.CHECKPOINT_PATH = checkpoint_base_path / f"best_ppo_{model_size}.pt"
-    best_ckpt_path = checkpoint_base_path / f"best_so_far_{model_size}.pt"
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    agent.CHECKPOINT_PATH = checkpoint_base_path / f"best_ppo_{model_size}_{timestamp}.pt"
+    best_ckpt_path = checkpoint_base_path / f"best_so_far_{model_size}_{timestamp}.pt"
 
     # Opponent pool (optional)
     opponent_pool = None
@@ -201,7 +210,7 @@ def initialize_training(
         # Static / config
         model_size=model_size, device=device, eval_vs=eval_vs,
         n_games=n_games, n_epochs=n_epochs, n_eval=n_eval,
-        use_opponent_pool=use_opponent_pool,
+        start_step=start_step, use_opponent_pool=use_opponent_pool,
         pool_snapshot_every=pool_snapshot_every,
         pool_max_size=pool_max_size,
         pool_sample_rate=pool_sample_rate,
@@ -212,6 +221,7 @@ def initialize_training(
         use_bc_warmstart=use_bc_warmstart,
         league_checkpoint_every=league_checkpoint_every,
         n_eval_league=n_eval_league,
+        timestamp=timestamp,
 
         # Runtime
         agent_instance=agent_instance,
@@ -439,7 +449,8 @@ def train(
     use_bc_warmstart=False,
     league_checkpoint_every=20_000,
     n_eval_league=50,
-    device='cpu'
+    device='cpu',
+    resume=None
 ):
     # 1) Initialize
     state = initialize_training(
@@ -450,7 +461,7 @@ def train(
         random_sample_rate=random_sample_rate, use_eval_lookahead=use_eval_lookahead,
         eval_lookahead_k=eval_lookahead_k, use_bc_warmstart=use_bc_warmstart,
         league_checkpoint_every=league_checkpoint_every, n_eval_league=n_eval_league,
-        device=device
+        device=device, resume=None
     )
 
     # 2) Training loop
@@ -498,7 +509,7 @@ def train(
 
     print("=" * 70)
 
-    plot_perf(state.perf_data, title=f"PPO Training ({state.model_size.upper()} model)")
+    plot_perf(state.perf_data, state.start_step, state.start_step+n_games, title=f"PPO Training ({state.model_size.upper()} model)", timestamp=state.timestamp)
 
 
 
@@ -513,7 +524,8 @@ if __name__ == "__main__":
                        help='Evaluate every N games')
     parser.add_argument('--cpu-test', action='store_true',
                        help='Quick test: small model, 10k games, frequent evals')
-
+    parser.add_argument('--resume', type=Path, default=None,
+                        help='Path to a .pt checkpoint to resume training from')
     args = parser.parse_args()
 
     # CPU test mode: fast settings for testing
@@ -561,4 +573,5 @@ if __name__ == "__main__":
             use_eval_lookahead=False,
             eval_lookahead_k=3,
             device = 'cpu',
+            resume = resume
         )
