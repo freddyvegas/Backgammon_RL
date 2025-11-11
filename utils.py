@@ -97,7 +97,7 @@ def _safe_save_agent(agent_module, path: Path, label: str = ""):
     else:
         print(f"[Checkpoint] Saved {label or path.name} -> {path}")
 
-def plot_perf(perf_data, start, end, title="Training progress", timestamp=""):
+def plot_perf(perf_data, start, end, n_epochs, title="Training progress", timestamp=""):
     """Plot performance metrics."""
     if not perf_data or not any(perf_data.values()):
         return
@@ -106,7 +106,7 @@ def plot_perf(perf_data, start, end, title="Training progress", timestamp=""):
 
     for label, data in perf_data.items():
         if data:
-            xs = np.arange(start, end)
+            xs = np.arange(start, end+1, n_epochs)
             ax.plot(xs, data, marker='o', label=label, linewidth=2)
 
     ax.set_xlabel("Evaluation Checkpoint", fontsize=12)
@@ -115,9 +115,10 @@ def plot_perf(perf_data, start, end, title="Training progress", timestamp=""):
     ax.legend(fontsize=10)
     ax.grid(True, alpha=0.3)
     plt.tight_layout()
-   
-    plt.savefig(f"training_plot_{timestamp}.png")
-    print(f"Training plot saved to training_plot.png")
+    
+    plot_name = f"training_plot_{timestamp}.png" 
+    plt.savefig(plot_name)
+    print(f"Training plot saved to {plot_name}")
 
 def _is_empty_move(move):
     if move is None: return True

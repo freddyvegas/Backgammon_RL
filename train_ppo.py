@@ -85,6 +85,7 @@ class TrainingState:
     agent_instance: "agent.PPOAgent" = None
     checkpoint_base_path: Path = None
     best_ckpt_path: Path = None
+    latest_ckpt_path: Path = None
     opponent_pool: "OpponentPool" = None
     league: "CheckpointLeague" = None
     baseline: object = None
@@ -161,6 +162,7 @@ def initialize_training(
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     agent.CHECKPOINT_PATH = checkpoint_base_path / f"best_ppo_{model_size}_{timestamp}.pt"
     best_ckpt_path = checkpoint_base_path / f"best_so_far_{model_size}_{timestamp}.pt"
+    latest_ckpt_path = checkpoint_base_path / f"latest_{model_size}_{timestamp}.pt"
 
     # Opponent pool (optional)
     opponent_pool = None
@@ -227,11 +229,12 @@ def initialize_training(
         agent_instance=agent_instance,
         checkpoint_base_path=checkpoint_base_path,
         best_ckpt_path=best_ckpt_path,
+        latest_ckpt_path=latest_ckpt_path,
         opponent_pool=opponent_pool,
         league=league,
         baseline=baseline,
         games_done=0,
-        next_eval_at=n_epochs,
+        next_eval_at=0,
         next_snapshot_at=pool_snapshot_every
     )
 
@@ -391,10 +394,12 @@ def validation_step(state: TrainingState):
     ai = state.agent_instance
     ran_eval = False
 
-    while state.games_done >= state.next_eval_at and state.next_eval_at > 0:
+    while state.games_done >= state.next_eval_at and state.next_eval_at >= 0:
         ran_eval = True
         print()
         ai.set_eval_mode(True)
+        # Save latest checkpoint
+        ai.save(str(state.latest_ckpt_path))
         print("[Eval] Agent in EVAL mode")
         print(f"\n--- Evaluation after {state.next_eval_at:,} games ---")
 
@@ -452,7 +457,7 @@ def train(
     device='cpu',
     resume=None
 ):
-    # 1) Initialize
+    # Initialize
     state = initialize_training(
         n_games=n_games, n_epochs=n_epochs, n_eval=n_eval, eval_vs=eval_vs,
         model_size=model_size, use_opponent_pool=use_opponent_pool,
@@ -461,10 +466,13 @@ def train(
         random_sample_rate=random_sample_rate, use_eval_lookahead=use_eval_lookahead,
         eval_lookahead_k=eval_lookahead_k, use_bc_warmstart=use_bc_warmstart,
         league_checkpoint_every=league_checkpoint_every, n_eval_league=n_eval_league,
-        device=device, resume=None
+        device=device, resume=resume
     )
 
-    # 2) Training loop
+    # Validate initial model
+    validation_step(state)
+
+    # Training loop
     train_bar = tqdm(total=state.n_games, desc="Training", unit="game")
     try:
         while state.games_done < state.n_games:
@@ -473,7 +481,7 @@ def train(
     finally:
         train_bar.close()
 
-    # 3) Final reporting
+    # Final reporting
     print()
     print("=" * 70)
     print("TRAINING COMPLETE")
@@ -500,7 +508,7 @@ def train(
     print(f"  Steps: {ai.steps}")
     print(f"  Entropy coef: {ai.current_entropy_coef:.4f}")
 
-    if hasattr(ai, 'rollout_stats'):
+    if hasattr(ai, 'rollout_st0ts'):
         stats = ai.rollout_stats
         if stats['nA_values']:
             print(f"  Avg legal actions: {np.mean(stats['nA_values'][-1000:]):.1f}")
@@ -509,7 +517,7 @@ def train(
 
     print("=" * 70)
 
-    plot_perf(state.perf_data, state.start_step, state.start_step+n_games, title=f"PPO Training ({state.model_size.upper()} model)", timestamp=state.timestamp)
+    plot_perf(state.perf_data, 0, n_games, n_epochs, title=f"PPO Training ({state.model_size.upper()} model)", timestamp=state.timestamp)
 
 
 
@@ -573,5 +581,5 @@ if __name__ == "__main__":
             use_eval_lookahead=False,
             eval_lookahead_k=3,
             device = 'cpu',
-            resume = resume
+            resume = args.resume
         )
