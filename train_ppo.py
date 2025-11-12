@@ -30,6 +30,7 @@ import pubeval_player as pubeval
 import random_player as randomAgent
 import flipped_agent as flipped_util
 import ppo_agent as agent
+import ppo_transformer_agent as transformer_agent
 from opponent_pool import OpponentPool
 from utils import _ensure_dir, _safe_save_agent, plot_perf, _is_empty_move, _apply_move_sequence, flip_to_pov_plus1, flip_to_pov_plus1, get_device
 from play_games import play_games_batched
@@ -132,6 +133,7 @@ def initialize_training(
     league_checkpoint_every=20_000,
     n_eval_league=50,
     device='cpu',
+    agent_type='MLP',
     resume=None
 ) -> TrainingState:
     print("\n" + "=" * 70)
@@ -150,7 +152,12 @@ def initialize_training(
     cfg = agent.get_config(model_size)
     cfg.ppo_epochs = 3
     cfg.entropy_min = 0.01
-    agent_instance = agent.PPOAgent(config=cfg, device=device)
+    if agent_type ==  'transformer':
+        agent_instance = transformer_agent.PPOAgent(config=cfg, device=device)
+    else:
+        agent_instance = agent.PPOAgent(config=cfg, device=device)
+
+
     if resume is not None:
        agent_instance.load(resume)
 
@@ -455,6 +462,7 @@ def train(
     league_checkpoint_every=20_000,
     n_eval_league=50,
     device='cpu',
+    agent_type='MLP',
     resume=None
 ):
     # Initialize
@@ -466,7 +474,7 @@ def train(
         random_sample_rate=random_sample_rate, use_eval_lookahead=use_eval_lookahead,
         eval_lookahead_k=eval_lookahead_k, use_bc_warmstart=use_bc_warmstart,
         league_checkpoint_every=league_checkpoint_every, n_eval_league=n_eval_league,
-        device=device, resume=resume
+        device=device, agent_type=agent_type, resume=resume
     )
 
     # Validate initial model
@@ -534,6 +542,8 @@ if __name__ == "__main__":
                        help='Quick test: small model, 10k games, frequent evals')
     parser.add_argument('--device', type=str, default='cpu',
                         help='Device type to train on')
+    parser.add_argument('--agent_type', type=str, default='MLP',
+                        help='Agent type to train')
     parser.add_argument('--resume', type=Path, default=None,
                         help='Path to a .pt checkpoint to resume training from')
     args = parser.parse_args()
@@ -583,5 +593,6 @@ if __name__ == "__main__":
             use_eval_lookahead=False,
             eval_lookahead_k=3,
             device = args.device,
+            agent_type = agent_type,
             resume = args.resume
         )
