@@ -542,7 +542,7 @@ if __name__ == "__main__":
                        help='Quick test: small model, 10k games, frequent evals')
     parser.add_argument('--device', type=str, default='cpu',
                         help='Device type to train on')
-    parser.add_argument('--agent_type', type=str, default='MLP',
+    parser.add_argument('--agent-type', type=str, default='MLP',
                         help='Agent type to train')
     parser.add_argument('--resume', type=Path, default=None,
                         help='Path to a .pt checkpoint to resume training from')
