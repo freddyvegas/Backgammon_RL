@@ -532,6 +532,8 @@ if __name__ == "__main__":
                        help='Evaluate every N games')
     parser.add_argument('--cpu-test', action='store_true',
                        help='Quick test: small model, 10k games, frequent evals')
+    parser.add_argument('--device', type=str, default='cpu',
+                        help='Device type to train on')
     parser.add_argument('--resume', type=Path, default=None,
                         help='Path to a .pt checkpoint to resume training from')
     args = parser.parse_args()
@@ -580,6 +582,6 @@ if __name__ == "__main__":
             random_sample_rate=0.00,    # 0% random (robustness only)
             use_eval_lookahead=False,
             eval_lookahead_k=3,
-            device = 'cpu',
+            device = args.device,
             resume = args.resume
         )
