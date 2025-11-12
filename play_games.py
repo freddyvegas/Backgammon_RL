@@ -2,7 +2,7 @@ import backgammon
 import pubeval_player as pubeval
 import random_player as randomAgent
 import flipped_agent as flipped_util
-from utils import one_hot_encoding, flip_to_pov_plus1, _is_empty_move, _apply_move_sequence
+from utils import one_hot_encoding, flip_to_pov_plus1, _is_empty_move, _apply_move_sequence, append_token, pad_truncate_seq, build_histories_batch
 import numpy as np
 import torch
 
@@ -297,6 +297,239 @@ def select_move_with_lookahead(agent_obj, board_pov, dice, i, k=3):
                 best_idx = idx
 
     return possible_moves[best_idx]
+
+def play_games_batched_transformer(agent_obj, opponent, batch_size=8, training=True):
+    """
+    Transformer-ready batched self-play that:
+      - tracks per-env token histories (293-d, +1 POV),
+      - calls agent_obj.batch_score(..., histories293=..., histories_len=...),
+      - pushes Transformer sequence tuples into the PPO buffer:
+        (seq_padded[N,293], seq_len, candidate_states[maxA,293], mask[maxA],
+         action, log_prob, value, reward, done, teacher_idx)
+    """
+    finished = 0
+
+    # Per-env containers
+    env_active  = [True] * batch_size
+    boards      = []
+    players     = []
+    dices       = []
+    passes_left = []
+
+    # Per-env trajectories (kept contiguous per env; flushed to global buffer on done)
+    per_env_rollouts = [[] for _ in range(batch_size)]
+
+    # Per-env histories of tokens (+1 POV)
+    histories293 = [[] for _ in range(batch_size)]
+    hist_lens    = [0  for _ in range(batch_size)]
+
+    # Shorthands
+    N    = agent_obj.config.max_seq_len
+    D    = agent_obj.config.state_dim
+    Amax = agent_obj.config.max_actions
+
+    # ---- Initialize games and seed history with initial token ----
+    for i in range(batch_size):
+        board  = backgammon.init_board()
+        player = 1
+        dice   = backgammon.roll_dice()
+
+        boards.append(board)
+        players.append(player)
+        dices.append(dice)
+        passes_left.append(2 if dice[0] == dice[1] else 1)
+
+        board_pov = flip_to_pov_plus1(board, 1)
+        append_token(histories293, hist_lens, i, board_pov, (passes_left[i] > 1), one_hot_encoding)
+
+    # ---- Main loop ----
+    while any(env_active):
+        agent_envs, opponent_envs = [], []
+
+        # Split agent/opponent turns; skip envs with no legal moves (pass handling)
+        for idx in range(batch_size):
+            if not env_active[idx]:
+                continue
+            player, dice, board = players[idx], dices[idx], boards[idx]
+            pmoves, pboards = backgammon.legal_moves(board, dice, player)
+
+            if len(pmoves) == 0:
+                passes_left[idx] -= 1
+                if passes_left[idx] <= 0:
+                    players[idx] = -player
+                    dices[idx] = backgammon.roll_dice()
+                    passes_left[idx] = 2 if dices[idx][0] == dices[idx][1] else 1
+                continue
+
+            (agent_envs if player == 1 else opponent_envs).append((idx, dice, board, pmoves, pboards))
+
+        # ---- Agent batch ----
+        if agent_envs:
+            # Build batched rows for current decision step
+            batch_states, batch_cand_states, batch_masks = [], [], []
+            per_env_candidates = []
+            h_batch, h_lens = [], []
+
+            for (idx, dice, board, pmoves, pboards) in agent_envs:
+                board_pov = flip_to_pov_plus1(board, 1)
+                moves_left = passes_left[idx]
+                # Make sure the current observation token is at the history tail
+                append_token(histories293, hist_lens, idx, board_pov, (moves_left > 1), one_hot_encoding)
+
+                # Build candidates (Amax, D)
+                cand_feats = np.zeros((Amax, D), dtype=np.float32)
+                mask = np.zeros(Amax, dtype=np.float32)
+                nA = min(len(pboards), Amax)
+                for a in range(nA):
+                    after29 = flip_to_pov_plus1(pboards[a], 1)
+                    # Next-step roll flag (approximate): after playing this partial move
+                    nSecondRoll_next = ((passes_left[idx] - 1) > 1)
+                    cand_feats[a] = one_hot_encoding(after29.astype(np.float32), nSecondRoll_next)
+                    mask[a] = 1.0
+
+                # For completeness (not strictly needed for the Transformer path)
+                S_feat = one_hot_encoding(board_pov.astype(np.float32), (moves_left > 1))
+
+                batch_states.append(S_feat)
+                batch_cand_states.append(cand_feats)
+                batch_masks.append(mask)
+                per_env_candidates.append((idx, pmoves, pboards))
+
+                h_batch.append(histories293[idx])
+                h_lens.append(hist_lens[idx])
+
+            # Stack fixed-size arrays
+            states_np      = np.stack(batch_states, axis=0)
+            cand_states_np = np.stack(batch_cand_states, axis=0)
+            masks_np       = np.stack(batch_masks, axis=0)
+
+            # Build padded histories for these selected rows only
+            hist_pad, hist_len = build_histories_batch(h_batch, h_lens)
+
+            # Query policy/value with full histories
+            logits, values = agent_obj.batch_score(
+                states_np, cand_states_np, masks_np,
+                histories293=hist_pad,
+                histories_len=hist_len
+            )
+
+            # Action selection
+            if training and not agent_obj.eval_mode:
+                probs = torch.softmax(logits, dim=-1)
+                a_idxs = torch.multinomial(probs, num_samples=1).squeeze(1)
+                a_idxs_long = a_idxs.long()
+                log_probs = torch.log(
+                    torch.gather(probs, 1, a_idxs_long.unsqueeze(1)).squeeze(1) + 1e-9
+                ).tolist()
+                a_idxs = a_idxs.tolist()
+            else:
+                a_idxs = torch.argmax(logits, dim=-1).tolist()
+                log_probs = [0.0] * len(a_idxs)
+
+            # Apply actions and record transitions
+            for row, (idx, pmoves, pboards) in enumerate(per_env_candidates):
+                a_idx = int(a_idxs[row])
+                if a_idx >= len(pmoves):  # clamp against padding
+                    a_idx = len(pmoves) - 1
+
+                chosen_move = pmoves[a_idx]
+                old_board = boards[idx].copy()
+                boards[idx] = backgammon.update_board(boards[idx], chosen_move, 1)
+
+                # Rewards
+                terminal_reward = 1.0 if boards[idx][27] == 15 else (-1.0 if boards[idx][28] == -15 else 0.0)
+                shaped_reward = 0.0
+                if training and not agent_obj.eval_mode and agent_obj.config.use_reward_shaping:
+                    board_pov_old = flip_to_pov_plus1(old_board, 1)
+                    board_pov_new = flip_to_pov_plus1(boards[idx], 1)
+                    shaped_reward = agent_obj._compute_shaped_reward(board_pov_old, board_pov_new)
+                reward = (terminal_reward + shaped_reward) * agent_obj.config.reward_scale
+                done = 1.0 if terminal_reward != 0.0 else 0.0
+
+                # Append the post-action observation token
+                append_token(histories293, hist_lens, idx, flip_to_pov_plus1(boards[idx], 1), False, one_hot_encoding)
+
+                # Push transformer tuple to per-env rollout (training only)
+                if training and not agent_obj.eval_mode:
+                    seq_padded, seq_len = pad_truncate_seq(histories293[idx], N, D)
+                    value = values[row].item() if hasattr(values[row], 'item') else float(values[row])
+                    per_env_rollouts[idx].append((
+                        seq_padded, int(seq_len),
+                        batch_cand_states[row], batch_masks[row],
+                        a_idx, float(log_probs[row]), float(value),
+                        float(reward), float(done), -1  # teacher_idx=-1
+                    ))
+                    agent_obj.steps += 1
+
+                # Episode end?
+                if backgammon.game_over(boards[idx]):
+                    env_active[idx] = False
+                    for (SEQ_, SEQL_, C_, M_, A_, LP_, V_, R_, D_, T_) in per_env_rollouts[idx]:
+                        agent_obj.buffer.push(SEQ_, SEQL_, C_, M_, A_, LP_, V_, R_, D_, T_)
+                    per_env_rollouts[idx].clear()
+                    if training and not agent_obj.eval_mode and agent_obj.buffer.is_ready():
+                        agent_obj._ppo_update()
+                    histories293[idx].clear(); hist_lens[idx] = 0
+                    finished += 1
+                else:
+                    passes_left[idx] -= 1
+                    if passes_left[idx] <= 0:
+                        players[idx] = -1
+                        dices[idx] = backgammon.roll_dice()
+                        passes_left[idx] = 2 if dices[idx][0] == dices[idx][1] else 1
+
+        # ---- Opponent (step individually) ----
+        for (idx, dice, board, pmoves, pboards) in opponent_envs:
+            # Choose opponent move
+            if opponent == randomAgent:
+                move = randomAgent.action(board, dice, -1, 0)
+            elif opponent == pubeval:
+                move = pubeval.action(board, dice, -1, 0)
+            elif hasattr(opponent, 'action'):
+                move = opponent.action(board, dice, -1, 0, train=False)
+            else:
+                import random as py_random
+                move = pmoves[py_random.randint(0, len(pmoves) - 1)]
+
+            if not _is_empty_move(move):
+                boards[idx] = _apply_move_sequence(board, move, -1)
+
+            # Append post-opponent token
+            append_token(histories293, hist_lens, idx, flip_to_pov_plus1(boards[idx], 1), False, one_hot_encoding)
+
+            # Episode end?
+            if backgammon.game_over(boards[idx]):
+                # Retro-credit if opponent just won
+                if training and not agent_obj.eval_mode and boards[idx][28] == -15:
+                    loss_reward = -1.0 * agent_obj.config.reward_scale
+                    if per_env_rollouts[idx]:
+                        (SEQ_, SEQL_, C_, M_, A_, LP_, V_, R_, D_, T_) = per_env_rollouts[idx][-1]
+                        per_env_rollouts[idx][-1] = (SEQ_, SEQL_, C_, M_, A_, LP_, V_, R_ + loss_reward, 1.0, T_)
+                    else:
+                        # Fabricate a 1-step terminal sample from current history
+                        seq_padded, seq_len = pad_truncate_seq(histories293[idx], N, D)
+                        C_feats = np.zeros((Amax, D), dtype=np.float32)
+                        C_feats[0] = seq_padded[max(0, seq_len - 1)]
+                        M = np.zeros(Amax, dtype=np.float32); M[0] = 1.0
+                        per_env_rollouts[idx].append((seq_padded, int(seq_len), C_feats, M, 0, 0.0, 0.0, float(loss_reward), 1.0, -1))
+
+                env_active[idx] = False
+                for (SEQ_, SEQL_, C_, M_, A_, LP_, V_, R_, D_, T_) in per_env_rollouts[idx]:
+                    agent_obj.buffer.push(SEQ_, SEQL_, C_, M_, A_, LP_, V_, R_, D_, T_)
+                per_env_rollouts[idx].clear()
+                if training and not agent_obj.eval_mode and agent_obj.buffer.is_ready():
+                    agent_obj._ppo_update()
+                histories293[idx].clear(); hist_lens[idx] = 0
+                finished += 1
+            else:
+                passes_left[idx] -= 1
+                if passes_left[idx] <= 0:
+                    players[idx] = 1
+                    dices[idx] = backgammon.roll_dice()
+                    passes_left[idx] = 2 if dices[idx][0] == dices[idx][1] else 1
+
+    return finished
+
 
 def play_one_game(agent1, agent2, training=False, commentary=False,
                   use_lookahead=False, lookahead_k=3):

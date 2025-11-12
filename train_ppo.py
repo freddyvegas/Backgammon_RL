@@ -33,7 +33,7 @@ import ppo_agent as agent
 import ppo_transformer_agent as transformer_agent
 from opponent_pool import OpponentPool
 from utils import _ensure_dir, _safe_save_agent, plot_perf, _is_empty_move, _apply_move_sequence, flip_to_pov_plus1, flip_to_pov_plus1, get_device
-from play_games import play_games_batched
+from play_games import play_games_batched, play_games_batched_transformer
 from evaluate import evaluate, CheckpointLeague
 
 # Set seeds for reproducibility
@@ -76,6 +76,7 @@ class TrainingState:
     league_checkpoint_every: int
     n_eval_league: int
     timestamp: str
+    agent_type: str
 
     # Curriculum tuning
     pool_start_games: int = 5_000
@@ -234,6 +235,7 @@ def initialize_training(
         league_checkpoint_every=league_checkpoint_every,
         n_eval_league=n_eval_league,
         timestamp=timestamp,
+        agent_type=agent_type,
 
         # Runtime
         agent_instance=agent_instance,
@@ -320,7 +322,10 @@ def train_step(state: TrainingState, train_bar: tqdm):
         opponent_type = 'self_play'
 
     # Play batch
-    finished = play_games_batched(ai, opponent, batch_size=BATCH_SIZE, training=True)
+    if state.agent_type == 'transformer':
+        finished = play_games_batched_transformer(ai, opponent, batch_size=BATCH_SIZE, training=True)
+    else:
+        finished = play_games_batched(ai, opponent, batch_size=BATCH_SIZE, training=True)
     if state.games_done + finished > state.n_games:
         finished = state.n_games - state.games_done
 

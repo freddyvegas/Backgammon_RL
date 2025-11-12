@@ -516,6 +516,110 @@ class PPOAgent:
         self.eval_mode = is_eval
         self.acnet.eval() if is_eval else self.acnet.train()
 
+    # -------- Batch scoring (compatibility with original agent) --------
+    def batch_score(self, states, cand_states, masks, *,
+                      histories293: Optional[np.ndarray] = None,
+                      histories_len: Optional[np.ndarray] = None,
+                      histories29: Optional[list] = None,
+                      moves_left_flags: Optional[list] = None):
+        """
+        Sequence-aware batch scoring (compatible with the original API, but
+        upgraded to use *real histories* when provided).
+
+        Args:
+            states:       (B, 29) raw +1 POV current boards (float/int). Used only
+                          if we need to infer the current token or when histories are missing.
+            cand_states:  (B, A, 29) raw +1 POV candidate after-states
+            masks:        (B, A) 1.0 for valid, 0.0 for padded
+            histories293: Optional (B, L, 293) array of per-sample state features.
+                          If given, these are used as the token sequences.
+            histories_len:Optional (B,) true lengths for histories293 before padding.
+            histories29:  Optional list/array of Python lists, where each element is
+                          a sequence of raw 29-d states. If provided (and histories293
+                          is None), we will encode them to 293 using one_hot_encoding.
+            moves_left_flags: Optional list parallel to histories29 providing a list
+                          of bools per step that indicates second-roll flag when
+                          encoding (defaults to False everywhere).
+
+        Returns:
+            logits: (B, A)
+            values: (B,)
+        """
+        B = len(states)
+        A = cand_states.shape[1]
+
+        # ---- Build candidate features ----
+        C_feat = np.zeros((B, A, self.config.state_dim), dtype=np.float32)
+        for i in range(B):
+            for a in range(A):
+                if masks[i, a] != 0.0:
+                    C_feat[i, a] = one_hot_encoding(cand_states[i, a].astype(np.float32), False)
+
+        # ---- Build sequence features ----
+        if histories293 is not None:
+            # Expect (B, L, 293) and optional lengths
+            H = histories293.astype(np.float32)
+            if histories_len is None:
+                # If not provided, assume full length for each sample
+                Lfull = H.shape[1]
+                histories_len = np.full((B,), Lfull, dtype=np.int64)
+            else:
+                histories_len = histories_len.astype(np.int64)
+            # Truncate to last N, and pad to max_seq_len
+            N = self.config.max_seq_len
+            Lout = N
+            seq_pad = np.zeros((B, N, self.config.state_dim), dtype=np.float32)
+            true_lens = np.zeros((B,), dtype=np.int64)
+            for i in range(B):
+                Li = int(histories_len[i])
+                take = min(Li, N)
+                if take > 0:
+                    seq_slice = H[i, Li - take: Li, :]
+                    seq_pad[i, :take, :] = seq_slice
+                true_lens[i] = take
+        elif histories29 is not None:
+            # Encode raw 29-d sequences into 293
+            N = self.config.max_seq_len
+            seq_pad = np.zeros((B, N, self.config.state_dim), dtype=np.float32)
+            true_lens = np.zeros((B,), dtype=np.int64)
+            for i in range(B):
+                seq29 = histories29[i]
+                if seq29 is None or len(seq29) == 0:
+                    true_lens[i] = 0
+                    continue
+                Li = len(seq29)
+                take = min(Li, N)
+                start = Li - take
+                for t in range(take):
+                    flag = False
+                    if moves_left_flags is not None and i < len(moves_left_flags) and (start + t) < len(moves_left_flags[i]):
+                        flag = bool(moves_left_flags[i][start + t])
+                    seq_pad[i, t, :] = one_hot_encoding(np.asarray(seq29[start + t], dtype=np.float32), flag)
+                true_lens[i] = take
+        else:
+            # Fallback: single-token sequences from current state
+            S_feat = np.stack([one_hot_encoding(states[i].astype(np.float32), False) for i in range(B)], axis=0).astype(np.float32)
+            N = self.config.max_seq_len
+            seq_pad = np.zeros((B, N, self.config.state_dim), dtype=np.float32)
+            seq_pad[:, 0, :] = S_feat
+            true_lens = np.ones((B,), dtype=np.int64)
+
+        # Safety: ensure min length at least 1 (Transformer expects a token). If 0, inject current state as token 0.
+        zero_len = (true_lens == 0)
+        if zero_len.any():
+            for i in np.where(zero_len)[0]:
+                seq_pad[i, 0, :] = one_hot_encoding(states[i].astype(np.float32), False)
+            true_lens[zero_len] = 1
+
+        # ---- Tensors and forward ----
+        seq_t = torch.as_tensor(seq_pad, dtype=torch.float32, device=self.device)
+        len_t = torch.as_tensor(true_lens, dtype=torch.int64, device=self.device)
+        cand_t = torch.as_tensor(C_feat, dtype=torch.float32, device=self.device)
+        mask_t = torch.as_tensor(masks, dtype=torch.float32, device=self.device)
+        with torch.no_grad():
+            logits, values = self.acnet(seq_t, len_t, cand_t, mask_t)
+        return logits, values
+
     # -------- GAE --------
     def _compute_gae(self, rewards, values, dones):
         T = len(rewards)
