@@ -593,6 +593,6 @@ if __name__ == "__main__":
             use_eval_lookahead=False,
             eval_lookahead_k=3,
             device = args.device,
-            agent_type = agent_type,
+            agent_type = args.agent_type,
             resume = args.resume
         )
