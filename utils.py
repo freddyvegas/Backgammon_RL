@@ -109,14 +109,13 @@ def plot_perf(perf_data, start, end, n_epochs, title="Training progress", timest
             xs = np.arange(start, end+1, n_epochs)
             ax.plot(xs, data, marker='o', label=label, linewidth=2)
 
-    ax.set_xlabel("Evaluation Checkpoint", fontsize=12)
+    ax.set_xlabel("Games played", fontsize=12)
     ax.set_ylabel("Win Rate (%)", fontsize=12)
     ax.set_title(title, fontsize=14, fontweight='bold')
     ax.legend(fontsize=10)
     ax.grid(True, alpha=0.3)
     plt.tight_layout()
-    
-    plot_name = f"training_plot_{timestamp}.png" 
+    plot_name = f"training_plot_{timestamp}.png"
     plt.savefig(plot_name)
     print(f"Training plot saved to {plot_name}")
 
