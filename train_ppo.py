@@ -149,12 +149,15 @@ def initialize_training(
     print("=" * 70 + "\n")
 
     # Agent + gentle curriculum tweaks
-    cfg = agent.get_config(model_size)
-    cfg.ppo_epochs = 3
-    cfg.entropy_min = 0.01
     if agent_type ==  'transformer':
+        cfg = transformer_agent.get_config(model_size)
+        cfg.ppo_epochs = 3
+        cfg.entropy_min = 0.01
         agent_instance = transformer_agent.PPOAgent(config=cfg, device=device)
     else:
+        cfg = agent.get_config(model_size)
+        cfg.ppo_epochs = 3
+        cfg.entropy_min = 0.01
         agent_instance = agent.PPOAgent(config=cfg, device=device)
 
 
