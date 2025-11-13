@@ -135,7 +135,7 @@ def initialize_training(
     device='cpu',
     agent_type='MLP',
     resume=None,
-    batch_size=batch_size
+    batch_size=8
 ) -> TrainingState:
     print("\n" + "=" * 70)
     print("PPO TRAINING")
