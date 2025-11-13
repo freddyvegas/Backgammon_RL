@@ -468,7 +468,7 @@ def train(
     device='cpu',
     agent_type='MLP',
     resume=None,
-    batch_size=batch_size
+    batch_size=8
 ):
     # Initialize
     state = initialize_training(
