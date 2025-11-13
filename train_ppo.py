@@ -218,7 +218,7 @@ def initialize_training(
     state = TrainingState(
         # Static / config
         model_size=model_size, device=device, eval_vs=eval_vs,
-        n_games=n_games, n_epochs=n_epochs, n_eval=n_eval,
+        n_games=n_games, n_epochs=n_epochs, n_eval=n_eval, batch_size=batch_size,
         start_step=start_step, use_opponent_pool=use_opponent_pool,
         pool_snapshot_every=pool_snapshot_every,
         pool_max_size=pool_max_size,
