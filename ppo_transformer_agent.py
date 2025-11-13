@@ -105,13 +105,12 @@ class SmallConfig(Config):
     n_layers = 4
     n_heads = 4
     d_ff = 768
-    max_seq_len = 48
+    max_seq_len = 32
     rollout_length = 256
     minibatch_size = 64
     lr = 5e-5
-    ppo_epochs = 2
+    ppo_epochs = 1
     clip_epsilon = 0.1
-    use_reward_shaping = False
 
 
 class MediumConfig(Config):
@@ -120,7 +119,7 @@ class MediumConfig(Config):
     n_layers = 6
     n_heads = 5
     d_ff = 1280
-    max_seq_len = 64
+    max_seq_len = 48
     rollout_length = 384
     minibatch_size = 96
 
@@ -404,6 +403,8 @@ class PPOAgent:
             attn_dropout=self.config.attn_dropout,
         ).to(self.device)
 
+        self.acnet = torch.compile(self.acnet)
+
         self.optimizer = torch.optim.AdamW(
             self.acnet.parameters(), lr=self.config.lr, weight_decay=self.config.weight_decay
         )
@@ -549,11 +550,15 @@ class PPOAgent:
         A = cand_states.shape[1]
 
         # ---- Build candidate features ----
-        C_feat = np.zeros((B, A, self.config.state_dim), dtype=np.float32)
-        for i in range(B):
-            for a in range(A):
-                if masks[i, a] != 0.0:
-                    C_feat[i, a] = one_hot_encoding(cand_states[i, a].astype(np.float32), False)
+        if cand_states.shape[-1] == self.config.state_dim:
+            # Already 293-d features (used by play_games_batched_transformer)
+            C_feat = cand_states.astype(np.float32)
+        else:
+            C_feat = np.zeros((B, A, self.config.state_dim), dtype=np.float32)
+            for i in range(B):
+                for a in range(A):
+                    if masks[i, a] != 0.0:
+                        C_feat[i, a] = one_hot_encoding(cand_states[i, a].astype(np.float32), False)
 
         # ---- Build sequence features ----
         if histories293 is not None:
@@ -598,7 +603,10 @@ class PPOAgent:
                 true_lens[i] = take
         else:
             # Fallback: single-token sequences from current state
-            S_feat = np.stack([one_hot_encoding(states[i].astype(np.float32), False) for i in range(B)], axis=0).astype(np.float32)
+            if states.shape[-1] == self.config.state_dim:
+                S_feat = states.astype(np.float32)
+            else:
+                S_feat = np.stack([one_hot_encoding(states[i].astype(np.float32), False) for i in range(B)], axis=0).astype(np.float32)
             N = self.config.max_seq_len
             seq_pad = np.zeros((B, N, self.config.state_dim), dtype=np.float32)
             seq_pad[:, 0, :] = S_feat

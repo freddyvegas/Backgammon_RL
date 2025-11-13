@@ -20,6 +20,7 @@ import os
 import random
 import torch
 import torch.nn.functional as F
+torch.backends.cudnn.benchmark = True
 import argparse
 import importlib
 from dataclasses import dataclass, field
@@ -46,9 +47,6 @@ if torch.cuda.is_available():
 
 # Local checkpoint directory
 CHECKPOINT_DIR = "./checkpoints"
-BATCH_SIZE = 8  # or 16/32 for more parallel games
-
-print(f"Batch self-play games: {BATCH_SIZE} games in parallel")
 
 # =========================
 # Core training structures
@@ -64,6 +62,7 @@ class TrainingState:
     n_epochs: int
     n_eval: int
     start_step: int
+    batch_size: int
     use_opponent_pool: bool
     pool_snapshot_every: int
     pool_max_size: int
@@ -135,7 +134,8 @@ def initialize_training(
     n_eval_league=50,
     device='cpu',
     agent_type='MLP',
-    resume=None
+    resume=None,
+    batch_size=batch_size
 ) -> TrainingState:
     print("\n" + "=" * 70)
     print("PPO TRAINING")
@@ -152,13 +152,9 @@ def initialize_training(
     # Agent + gentle curriculum tweaks
     if agent_type ==  'transformer':
         cfg = transformer_agent.get_config(model_size)
-        cfg.ppo_epochs = 3
-        cfg.entropy_min = 0.01
         agent_instance = transformer_agent.PPOAgent(config=cfg, device=device)
     else:
         cfg = agent.get_config(model_size)
-        cfg.ppo_epochs = 3
-        cfg.entropy_min = 0.01
         agent_instance = agent.PPOAgent(config=cfg, device=device)
 
 
@@ -323,9 +319,9 @@ def train_step(state: TrainingState, train_bar: tqdm):
 
     # Play batch
     if state.agent_type == 'transformer':
-        finished = play_games_batched_transformer(ai, opponent, batch_size=BATCH_SIZE, training=True)
+        finished = play_games_batched_transformer(ai, opponent, batch_size=state.batch_size, training=True)
     else:
-        finished = play_games_batched(ai, opponent, batch_size=BATCH_SIZE, training=True)
+        finished = play_games_batched(ai, opponent, batch_size=state.batch_size, training=True)
     if state.games_done + finished > state.n_games:
         finished = state.n_games - state.games_done
 
@@ -471,7 +467,8 @@ def train(
     n_eval_league=50,
     device='cpu',
     agent_type='MLP',
-    resume=None
+    resume=None,
+    batch_size=batch_size
 ):
     # Initialize
     state = initialize_training(
@@ -482,12 +479,13 @@ def train(
         random_sample_rate=random_sample_rate, use_eval_lookahead=use_eval_lookahead,
         eval_lookahead_k=eval_lookahead_k, use_bc_warmstart=use_bc_warmstart,
         league_checkpoint_every=league_checkpoint_every, n_eval_league=n_eval_league,
-        device=device, agent_type=agent_type, resume=resume
+        device=device, agent_type=agent_type, resume=resume, batch_size=batch_size
     )
 
     # Validate initial model
     validation_step(state)
 
+    print(f"Training on {args.batch_size} games in parallel")
     # Training loop
     train_bar = tqdm(total=state.n_games, desc="Training", unit="game")
     try:
@@ -546,6 +544,8 @@ if __name__ == "__main__":
                        help='Total number of training games')
     parser.add_argument('--n-epochs', type=int, default=5_000,
                        help='Evaluate every N games')
+    parser.add_argument('--batch-size', type=int, default=8,
+                       help='Training batch size')
     parser.add_argument('--cpu-test', action='store_true',
                        help='Quick test: small model, 10k games, frequent evals')
     parser.add_argument('--device', type=str, default='cpu',
@@ -602,5 +602,6 @@ if __name__ == "__main__":
             eval_lookahead_k=3,
             device = args.device,
             agent_type = args.agent_type,
-            resume = args.resume
+            resume = args.resume,
+            batch_size = args.batch_size
         )
