@@ -83,69 +83,43 @@ def one_hot_encoding(board29, nSecondRoll: bool):
 
     return oneHot
 
-def one_hot_encoding_torch(board29, nSecondRoll: bool | torch.Tensor):
-    """
-    Torch-based, vectorized version of the one-hot encoder.
-
-    Args:
-        board29: torch.Tensor with shape (..., 29)
-                 +1 POV, same semantics as the NumPy version.
-        nSecondRoll:
-            - bool or scalar, or
-            - tensor broadcastable to board29.shape[:-1]
-
-    Returns:
-        torch.Tensor with shape (..., 293) in float32 on board29.device.
-    """
-    if not torch.is_tensor(board29):
-        board29 = torch.as_tensor(board29, dtype=torch.float32)
+def one_hot_encoding_torch(board29_t, nSecondRoll):
+    if not torch.is_tensor(board29_t):
+        board29_t = torch.as_tensor(board29_t, dtype=torch.float32)
     else:
-        board29 = board29.to(dtype=torch.float32)
+        board29_t = board29_t.to(dtype=torch.float32)
+    device = board29_t.device
 
-    device = board29.device
-
-    pts = board29[..., 1:25]  # (..., 24)
-
-    # Output shape (..., 293)
-    out_shape = board29.shape[:-1] + (STATE_DIM,)
+    pts = board29_t[..., 1:25]  # (..., 24)
+    out_shape = board29_t.shape[:-1] + (STATE_DIM,)
     out = torch.zeros(out_shape, device=device, dtype=torch.float32)
 
-    # +1 side bins: i = 0..4, then >=5
+    # +1 side
     for i in range(5):
-        # mask (..., 24)
         mask = (pts == float(i)).to(torch.float32)
-        out[..., i * 24 : (i + 1) * 24] = mask
-
+        out[..., i * 24:(i + 1) * 24] = mask
     mask_ge5_pos = (pts >= 5).to(torch.float32)
-    out[..., 5 * 24 : 6 * 24] = mask_ge5_pos
+    out[..., 5 * 24:6 * 24] = mask_ge5_pos
 
-    # -1 side bins: work with negated pts
+    # -1 side
     neg_pts = -pts
     base = 6 * 24
     for i in range(5):
         mask = (neg_pts == float(i)).to(torch.float32)
-        out[..., base + i * 24 : base + (i + 1) * 24] = mask
-
+        out[..., base + i * 24:base + (i + 1) * 24] = mask
     mask_ge5_neg = (neg_pts >= 5).to(torch.float32)
-    out[..., base + 5 * 24 : base + 6 * 24] = mask_ge5_neg
+    out[..., base + 5 * 24:base + 6 * 24] = mask_ge5_neg
 
     # bars/offs
-    out[..., 12 * 24 + 0] = board29[..., 25]
-    out[..., 12 * 24 + 1] = board29[..., 26]
-    out[..., 12 * 24 + 2] = board29[..., 27]
-    out[..., 12 * 24 + 3] = board29[..., 28]
+    out[..., 12 * 24 + 0] = board29_t[..., 25]
+    out[..., 12 * 24 + 1] = board29_t[..., 26]
+    out[..., 12 * 24 + 2] = board29_t[..., 27]
+    out[..., 12 * 24 + 3] = board29_t[..., 28]
 
     # second-roll flag
-    if torch.is_tensor(nSecondRoll):
-        flag = nSecondRoll.to(device=device, dtype=torch.float32)
-    else:
-        # bool or scalar
-        flag = torch.as_tensor(float(nSecondRoll), device=device, dtype=torch.float32)
-
-    # Broadcast flag to the batch dims if needed
+    flag = torch.as_tensor(float(nSecondRoll), device=device, dtype=torch.float32)
     if flag.shape != out.shape[:-1]:
         flag = flag.expand(out.shape[:-1])
-
     out[..., 12 * 24 + 4] = flag
 
     return out
@@ -243,17 +217,8 @@ def append_token(histories293, hist_lens, idx, board29, nSecondRoll_flag, one_ho
         histories293[idx].append(token)
         hist_lens[idx] += 1
 
-def append_token_torch(histories293, hist_lens, idx, board29, nSecondRoll_flag):
-    """
-    Torch version of append_token.
-
-    histories293: list[list[torch.Tensor(293,)]]
-    hist_lens: list[int]
-    idx: env index
-    board29: np.ndarray(29,) or torch.Tensor(29,)
-    """
-    # Encode as torch (vectorized)
-    board29_t = torch.as_tensor(board29, dtype=torch.float32)
+def append_token_torch(histories293, hist_lens, idx, board29, nSecondRoll_flag, device=None):
+    board29_t = torch.as_tensor(board29, dtype=torch.float32, device=device)
     token = one_hot_encoding_torch(board29_t, nSecondRoll_flag)  # (293,)
 
     if hist_lens[idx] == 0 or not torch.equal(histories293[idx][-1], token):
@@ -326,33 +291,23 @@ def build_histories_batch(histories293, hist_lens):
             hist_pad[i, :L_i, :] = seq_i
     return hist_pad, np.asarray(hist_lens, dtype=np.int64)
 
-def build_histories_batch_torch(histories293, hist_lens):
-    """
-    Torch version of build_histories_batch.
-
-    histories293: list[list[torch.Tensor(293,)]]
-    hist_lens: list[int]
-
-    Returns:
-        hist_pad: torch.Tensor (B, L_max, 293)
-        hist_len: torch.Tensor (B,)
-    """
-    B = len(histories293)
-    # Handle empty histories gracefully
+def build_histories_batch_torch(h_batch, h_lens, device=None):
+    B = len(h_batch)
     if B == 0:
         return torch.zeros(0, 1, STATE_DIM), torch.zeros(0, dtype=torch.long)
 
-    D = histories293[0][0].shape[-1] if histories293[0] else STATE_DIM
-    L_max = max(1, max(hist_lens))
+    L_max = max(1, max(h_lens))
+    D = STATE_DIM
+    if device is None:
+        device = h_batch[0][0].device
 
-    device = histories293[0][0].device if histories293[0] else torch.device("cpu")
     hist_pad = torch.zeros((B, L_max, D), dtype=torch.float32, device=device)
-    hist_len = torch.as_tensor(hist_lens, dtype=torch.long, device=device)
+    hist_len = torch.as_tensor(h_lens, dtype=torch.long, device=device)
 
     for i in range(B):
-        L_i = hist_lens[i]
+        L_i = h_lens[i]
         if L_i > 0:
-            seq_i = torch.stack(histories293[i], dim=0).to(device=device, dtype=torch.float32)
+            seq_i = torch.stack(h_batch[i], dim=0).to(device=device, dtype=torch.float32)
             hist_pad[i, :L_i, :] = seq_i
 
     return hist_pad, hist_len
