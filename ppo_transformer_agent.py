@@ -519,176 +519,176 @@ class PPOAgent:
 
     # -------- Batch scoring (compatibility with original agent) --------
     def batch_score(self, states, cand_states, masks, *,
-                histories293: Optional[np.ndarray] = None,
-                histories_len: Optional[np.ndarray] = None,
-                histories29: Optional[list] = None,
-                moves_left_flags: Optional[list] = None):
-    """
-    Sequence-aware batch scoring (compatible with the original API, but
-    upgraded to use *real histories* when provided).
+                    histories293: Optional[np.ndarray] = None,
+                    histories_len: Optional[np.ndarray] = None,
+                    histories29: Optional[list] = None,
+                    moves_left_flags: Optional[list] = None):
+        """
+        Sequence-aware batch scoring (compatible with the original API, but
+        upgraded to use *real histories* when provided).
 
-    Args:
-        states:       (B, 29) raw +1 POV current boards (float/int) or (B, 293)
-                      torch tensor or numpy array. Used only if we need to
-                      infer the current token or when histories are missing.
-        cand_states:  (B, A, 29) raw +1 POV candidate after-states OR
-                      (B, A, 293) pre-encoded features.
-        masks:        (B, A) 1.0 for valid, 0.0 for padded (numpy or torch).
-        histories293: Optional (B, L, 293) array/tensor of per-sample state
-                      features. If given, these are used as the token sequences.
-        histories_len:Optional (B,) true lengths for histories293 before padding.
-        histories29:  Optional list/array of Python lists, where each element is
-                      a sequence of raw 29-d states. If provided (and histories293
-                      is None), we will encode them to 293 using one_hot_encoding_torch.
-        moves_left_flags: Optional list parallel to histories29 providing a list
-                      of bools per step that indicates second-roll flag when
-                      encoding (defaults to False everywhere).
+        Args:
+            states:       (B, 29) raw +1 POV current boards (float/int) or (B, 293)
+                          torch tensor or numpy array. Used only if we need to
+                          infer the current token or when histories are missing.
+            cand_states:  (B, A, 29) raw +1 POV candidate after-states OR
+                          (B, A, 293) pre-encoded features.
+            masks:        (B, A) 1.0 for valid, 0.0 for padded (numpy or torch).
+            histories293: Optional (B, L, 293) array/tensor of per-sample state
+                          features. If given, these are used as the token sequences.
+            histories_len:Optional (B,) true lengths for histories293 before padding.
+            histories29:  Optional list/array of Python lists, where each element is
+                          a sequence of raw 29-d states. If provided (and histories293
+                          is None), we will encode them to 293 using one_hot_encoding_torch.
+            moves_left_flags: Optional list parallel to histories29 providing a list
+                          of bools per step that indicates second-roll flag when
+                          encoding (defaults to False everywhere).
 
-    Returns:
-        logits: (B, A)
-        values: (B,)
-    """
-    if states is None:
-        raise ValueError("batch_score expects 'states' to be provided (for zero-length safety fallback).")
+        Returns:
+            logits: (B, A)
+            values: (B,)
+        """
+        if states is None:
+            raise ValueError("batch_score expects 'states' to be provided (for zero-length safety fallback).")
 
-    # ---- Batch size ----
-    if torch.is_tensor(states):
-        B = states.size(0)
-    else:
-        B = len(states)
-
-    # ---- Candidate features (C_feat) ----
-    # Accept:
-    #   - torch or numpy
-    #   - either 29-d raw boards, or 293-d encoded features
-    if torch.is_tensor(cand_states):
-        cand_t = cand_states.to(self.device, dtype=torch.float32)
-        if cand_t.shape[-1] != self.config.state_dim:
-            # (B, A, 29) -> (B, A, 293) via vectorized torch encoder
-            cand_t = one_hot_encoding_torch(cand_t, nSecondRoll=False)
-    else:
-        cand_np = np.asarray(cand_states, dtype=np.float32)
-        cand_t = torch.from_numpy(cand_np).to(self.device)
-        if cand_t.shape[-1] != self.config.state_dim:
-            cand_t = one_hot_encoding_torch(cand_t, nSecondRoll=False)
-
-    # ---- Masks ----
-    if torch.is_tensor(masks):
-        mask_t = masks.to(self.device, dtype=torch.float32)
-    else:
-        mask_np = np.asarray(masks, dtype=np.float32)
-        mask_t = torch.from_numpy(mask_np).to(self.device)
-
-    # ---- Build sequence features (seq_pad, true_lens) ----
-    N = self.config.max_seq_len
-    D = self.config.state_dim
-
-    # 1) histories293 provided (already encoded)
-    if histories293 is not None:
-        if torch.is_tensor(histories293):
-            H_t = histories293.to(self.device, dtype=torch.float32)
-        else:
-            H_np = np.asarray(histories293, dtype=np.float32)
-            H_t = torch.from_numpy(H_np).to(self.device)
-
-        if histories_len is None:
-            Lfull = H_t.size(1)
-            len_t = torch.full((B,), Lfull, dtype=torch.long, device=self.device)
-        else:
-            if torch.is_tensor(histories_len):
-                len_t = histories_len.to(self.device, dtype=torch.long)
-            else:
-                len_np = np.asarray(histories_len, dtype=np.int64)
-                len_t = torch.from_numpy(len_np).to(self.device)
-
-        seq_pad_t = torch.zeros((B, N, D), dtype=torch.float32, device=self.device)
-        true_lens_t = torch.zeros((B,), dtype=torch.long, device=self.device)
-
-        for i in range(B):
-            Li = int(len_t[i].item())
-            take = min(Li, N)
-            if take > 0:
-                seq_slice = H_t[i, Li - take: Li, :]  # last 'take' tokens
-                seq_pad_t[i, :take, :] = seq_slice
-            true_lens_t[i] = take
-
-    # 2) histories29 provided: encode sequences on the fly with torch
-    elif histories29 is not None:
-        seq_pad_t = torch.zeros((B, N, D), dtype=torch.float32, device=self.device)
-        true_lens_t = torch.zeros((B,), dtype=torch.long, device=self.device)
-
-        for i in range(B):
-            seq29 = histories29[i]
-            if seq29 is None or len(seq29) == 0:
-                true_lens_t[i] = 0
-                continue
-
-            Li = len(seq29)
-            take = min(Li, N)
-            start = Li - take
-
-            # (take, 29) board sequence
-            boards29_t = torch.as_tensor(
-                seq29[start:Li],
-                dtype=torch.float32,
-                device=self.device
-            )
-
-            # second-roll flags for this sequence (take,)
-            if moves_left_flags is not None and i < len(moves_left_flags):
-                flags_i = moves_left_flags[i][start:Li]
-                flags_t = torch.as_tensor(flags_i, dtype=torch.float32, device=self.device)
-            else:
-                flags_t = torch.zeros(take, dtype=torch.float32, device=self.device)
-
-            tokens_t = one_hot_encoding_torch(boards29_t, flags_t)
-            seq_pad_t[i, :take, :] = tokens_t
-            true_lens_t[i] = take
-
-    # 3) Fallback: single-token sequences from current state
-    else:
-        # states may already be 293-d features
+        # ---- Batch size ----
         if torch.is_tensor(states):
-            S_t = states.to(self.device, dtype=torch.float32)
-            if S_t.shape[-1] != D:
-                S_t = one_hot_encoding_torch(S_t, nSecondRoll=False)
+            B = states.size(0)
         else:
-            states_np = np.asarray(states, dtype=np.float32)
-            states_t = torch.from_numpy(states_np).to(self.device)
+            B = len(states)
+
+        # ---- Candidate features (C_feat) ----
+        # Accept:
+        #   - torch or numpy
+        #   - either 29-d raw boards, or 293-d encoded features
+        if torch.is_tensor(cand_states):
+            cand_t = cand_states.to(self.device, dtype=torch.float32)
+            if cand_t.shape[-1] != self.config.state_dim:
+                # (B, A, 29) -> (B, A, 293) via vectorized torch encoder
+                cand_t = one_hot_encoding_torch(cand_t, nSecondRoll=False)
+        else:
+            cand_np = np.asarray(cand_states, dtype=np.float32)
+            cand_t = torch.from_numpy(cand_np).to(self.device)
+            if cand_t.shape[-1] != self.config.state_dim:
+                cand_t = one_hot_encoding_torch(cand_t, nSecondRoll=False)
+
+        # ---- Masks ----
+        if torch.is_tensor(masks):
+            mask_t = masks.to(self.device, dtype=torch.float32)
+        else:
+            mask_np = np.asarray(masks, dtype=np.float32)
+            mask_t = torch.from_numpy(mask_np).to(self.device)
+
+        # ---- Build sequence features (seq_pad, true_lens) ----
+        N = self.config.max_seq_len
+        D = self.config.state_dim
+
+        # 1) histories293 provided (already encoded)
+        if histories293 is not None:
+            if torch.is_tensor(histories293):
+                H_t = histories293.to(self.device, dtype=torch.float32)
+            else:
+                H_np = np.asarray(histories293, dtype=np.float32)
+                H_t = torch.from_numpy(H_np).to(self.device)
+
+            if histories_len is None:
+                Lfull = H_t.size(1)
+                len_t = torch.full((B,), Lfull, dtype=torch.long, device=self.device)
+            else:
+                if torch.is_tensor(histories_len):
+                    len_t = histories_len.to(self.device, dtype=torch.long)
+                else:
+                    len_np = np.asarray(histories_len, dtype=np.int64)
+                    len_t = torch.from_numpy(len_np).to(self.device)
+
+            seq_pad_t = torch.zeros((B, N, D), dtype=torch.float32, device=self.device)
+            true_lens_t = torch.zeros((B,), dtype=torch.long, device=self.device)
+
+            for i in range(B):
+                Li = int(len_t[i].item())
+                take = min(Li, N)
+                if take > 0:
+                    seq_slice = H_t[i, Li - take: Li, :]  # last 'take' tokens
+                    seq_pad_t[i, :take, :] = seq_slice
+                true_lens_t[i] = take
+
+        # 2) histories29 provided: encode sequences on the fly with torch
+        elif histories29 is not None:
+            seq_pad_t = torch.zeros((B, N, D), dtype=torch.float32, device=self.device)
+            true_lens_t = torch.zeros((B,), dtype=torch.long, device=self.device)
+
+            for i in range(B):
+                seq29 = histories29[i]
+                if seq29 is None or len(seq29) == 0:
+                    true_lens_t[i] = 0
+                    continue
+
+                Li = len(seq29)
+                take = min(Li, N)
+                start = Li - take
+
+                # (take, 29) board sequence
+                boards29_t = torch.as_tensor(
+                    seq29[start:Li],
+                    dtype=torch.float32,
+                    device=self.device
+                )
+
+                # second-roll flags for this sequence (take,)
+                if moves_left_flags is not None and i < len(moves_left_flags):
+                    flags_i = moves_left_flags[i][start:Li]
+                    flags_t = torch.as_tensor(flags_i, dtype=torch.float32, device=self.device)
+                else:
+                    flags_t = torch.zeros(take, dtype=torch.float32, device=self.device)
+
+                tokens_t = one_hot_encoding_torch(boards29_t, flags_t)
+                seq_pad_t[i, :take, :] = tokens_t
+                true_lens_t[i] = take
+
+        # 3) Fallback: single-token sequences from current state
+        else:
+            # states may already be 293-d features
+            if torch.is_tensor(states):
+                S_t = states.to(self.device, dtype=torch.float32)
+                if S_t.shape[-1] != D:
+                    S_t = one_hot_encoding_torch(S_t, nSecondRoll=False)
+            else:
+                states_np = np.asarray(states, dtype=np.float32)
+                states_t = torch.from_numpy(states_np).to(self.device)
+                if states_t.shape[-1] == D:
+                    S_t = states_t
+                else:
+                    S_t = one_hot_encoding_torch(states_t, nSecondRoll=False)
+
+            seq_pad_t = torch.zeros((B, N, D), dtype=torch.float32, device=self.device)
+            seq_pad_t[:, 0, :] = S_t
+            true_lens_t = torch.ones((B,), dtype=torch.long, device=self.device)
+
+        # ---- Safety: ensure min length at least 1 ----
+        # If length is 0, inject current state as token 0.
+        zero_len_mask = (true_lens_t == 0)
+        if zero_len_mask.any():
+            # Build a state feature tensor for those problematic samples
+            if torch.is_tensor(states):
+                states_t = states.to(self.device, dtype=torch.float32)
+            else:
+                states_np = np.asarray(states, dtype=np.float32)
+                states_t = torch.from_numpy(states_np).to(self.device)
+
             if states_t.shape[-1] == D:
-                S_t = states_t
+                S_all = states_t
             else:
-                S_t = one_hot_encoding_torch(states_t, nSecondRoll=False)
+                S_all = one_hot_encoding_torch(states_t, nSecondRoll=False)
 
-        seq_pad_t = torch.zeros((B, N, D), dtype=torch.float32, device=self.device)
-        seq_pad_t[:, 0, :] = S_t
-        true_lens_t = torch.ones((B,), dtype=torch.long, device=self.device)
+            idxs = torch.nonzero(zero_len_mask, as_tuple=False).view(-1)
+            seq_pad_t[idxs, 0, :] = S_all[idxs]
+            true_lens_t[zero_len_mask] = 1
 
-    # ---- Safety: ensure min length at least 1 ----
-    # If length is 0, inject current state as token 0.
-    zero_len_mask = (true_lens_t == 0)
-    if zero_len_mask.any():
-        # Build a state feature tensor for those problematic samples
-        if torch.is_tensor(states):
-            states_t = states.to(self.device, dtype=torch.float32)
-        else:
-            states_np = np.asarray(states, dtype=np.float32)
-            states_t = torch.from_numpy(states_np).to(self.device)
+        # ---- Forward pass ----
+        with torch.no_grad():
+            logits, values = self.acnet(seq_pad_t, true_lens_t, cand_t, mask_t)
 
-        if states_t.shape[-1] == D:
-            S_all = states_t
-        else:
-            S_all = one_hot_encoding_torch(states_t, nSecondRoll=False)
-
-        idxs = torch.nonzero(zero_len_mask, as_tuple=False).view(-1)
-        seq_pad_t[idxs, 0, :] = S_all[idxs]
-        true_lens_t[zero_len_mask] = 1
-
-    # ---- Forward pass ----
-    with torch.no_grad():
-        logits, values = self.acnet(seq_pad_t, true_lens_t, cand_t, mask_t)
-
-    return logits, values
+        return logits, values
 
     # -------- GAE --------
     def _compute_gae(self, rewards, values, dones):
