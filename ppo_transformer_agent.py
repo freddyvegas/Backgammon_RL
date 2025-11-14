@@ -57,7 +57,7 @@ class Config:
     resid_dropout = 0.1
 
     # PPO hyperparameters (gentler for stability)
-    lr = 5e-5
+    lr = 1e-4
     gamma = 0.99
     gae_lambda = 0.95
     clip_epsilon = 0.1
@@ -108,7 +108,6 @@ class SmallConfig(Config):
     max_seq_len = 32
     rollout_length = 256
     minibatch_size = 64
-    lr = 5e-5
     ppo_epochs = 1
     clip_epsilon = 0.1
 
