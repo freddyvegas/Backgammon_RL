@@ -9,12 +9,17 @@ import torch
 def play_games_batched(agent_obj, opponent, batch_size=8, training=True):
     """
     Run up to `batch_size` games in parallel and feed batched states to the network.
-    Uses the same reward shaping and rollout buffer logic the agent expects.
+    Supports both PPO (with batch_score and buffer) and A2C (direct action calls).
     """
     finished = 0
-    # Keep trajectories per environment so GAE never mixes them
-    per_env_rollouts = [[] for _ in range(batch_size)]
-
+    
+    # Detect agent type once at the start
+    is_ppo_like = hasattr(agent_obj, "batch_score") and hasattr(agent_obj, "buffer") and hasattr(agent_obj.config, "max_actions")
+    
+    # Keep trajectories per environment (PPO only)
+    if is_ppo_like:
+        per_env_rollouts = [[] for _ in range(batch_size)]
+    
     # Each slot holds the current env state or None if finished
     env_active = [True] * batch_size
     boards     = []
@@ -52,7 +57,6 @@ def play_games_batched(agent_obj, opponent, batch_size=8, training=True):
                 # No legal moves, decrement passes and switch if needed
                 passes_left[idx] -= 1
                 if passes_left[idx] <= 0:
-                    # FIX #4: Switch players only when passes exhausted
                     players[idx] = -player
                     dices[idx] = backgammon.roll_dice()
                     passes_left[idx] = 2 if dices[idx][0] == dices[idx][1] else 1
@@ -63,8 +67,9 @@ def play_games_batched(agent_obj, opponent, batch_size=8, training=True):
             else:
                 opponent_envs.append((idx, dice, board, pmoves, pboards))
 
-        # ---- Process agent moves in batch ----
-        if agent_envs:
+        # ---- Process agent moves ----
+        if agent_envs and is_ppo_like:
+            # PPO path: batch scoring with after-states
             batch_states = []
             batch_cand_states = []
             batch_masks = []
@@ -184,14 +189,32 @@ def play_games_batched(agent_obj, opponent, batch_size=8, training=True):
                         dices[idx] = backgammon.roll_dice()
                         passes_left[idx] = 2 if dices[idx][0] == dices[idx][1] else 1
 
+        elif agent_envs:
+            # A2C path: direct action calls (no batch scoring, no buffer)
+            for (idx, dice, board, pmoves, pboards) in agent_envs:
+                # Agent acts directly (handles its own learning inside action())
+                move = agent_obj.action(board, dice, +1, 0, train=training)
+                if not _is_empty_move(move):
+                    boards[idx] = _apply_move_sequence(board, move, +1)
+
+                # Check terminal and pass handling
+                done = backgammon.game_over(boards[idx])
+                if done:
+                    env_active[idx] = False
+                    finished += 1
+                else:
+                    passes_left[idx] -= 1
+                    if passes_left[idx] <= 0:
+                        players[idx] = -1
+                        dices[idx] = backgammon.roll_dice()
+                        passes_left[idx] = 2 if dices[idx][0] == dices[idx][1] else 1
+
         # ---- Process opponent moves individually ----
         for (idx, dice, board, pmoves, pboards) in opponent_envs:
             # Opponent makes a move
             if opponent == randomAgent:
-                # Random opponent
                 move = randomAgent.action(board, dice, -1, 0)
             elif opponent == pubeval:
-                # Pubeval opponent
                 move = pubeval.action(board, dice, -1, 0)
             elif hasattr(opponent, 'action'):
                 # Another agent (from pool or self-play)
@@ -207,28 +230,36 @@ def play_games_batched(agent_obj, opponent, batch_size=8, training=True):
             # Check if game over
             done = backgammon.game_over(boards[idx])
             if done:
-                # First: retro-credit opponent win to last agent step (if it happened)
-                if training and not agent_obj.eval_mode and boards[idx][28] == -15:
-                    loss_reward = -1.0 * agent_obj.config.reward_scale
-                    if per_env_rollouts[idx]:
-                        (S_, C_, M_, A_, LP_, V_, R_, D_) = per_env_rollouts[idx][-1]
-                        per_env_rollouts[idx][-1] = (S_, C_, M_, A_, LP_, V_, R_ + loss_reward, 1.0)
-                    else:
-                        # Rare: agent never acted – fabricate a 1-step terminal sample in FEATURE space
-                        board_pov29 = flip_to_pov_plus1(boards[idx], 1).astype(np.float32)
-                        S_feat = one_hot_encoding(board_pov29, False)
-                        C_feats = np.zeros((agent_obj.config.max_actions, agent_obj.config.state_dim), dtype=np.float32)
-                        C_feats[0] = S_feat
-                        M = np.zeros(agent_obj.config.max_actions, dtype=np.float32); M[0] = 1.0
-                        per_env_rollouts[idx].append((S_feat, C_feats, M, 0, 0.0, 0.0, loss_reward, 1.0))
+                if is_ppo_like:
+                    # PPO path: retro-credit opponent win to last agent step
+                    if training and not agent_obj.eval_mode and boards[idx][28] == -15:
+                        loss_reward = -1.0 * agent_obj.config.reward_scale
+                        if per_env_rollouts[idx]:
+                            # Update last transition with loss reward
+                            (S_, C_, M_, A_, LP_, V_, R_, D_) = per_env_rollouts[idx][-1]
+                            per_env_rollouts[idx][-1] = (S_, C_, M_, A_, LP_, V_, R_ + loss_reward, 1.0)
+                        else:
+                            # Rare: agent never acted - fabricate a 1-step terminal sample
+                            board_pov29 = flip_to_pov_plus1(boards[idx], 1).astype(np.float32)
+                            S_feat = one_hot_encoding(board_pov29, False)
+                            C_feats = np.zeros((agent_obj.config.max_actions, agent_obj.config.state_dim), dtype=np.float32)
+                            C_feats[0] = S_feat
+                            M = np.zeros(agent_obj.config.max_actions, dtype=np.float32)
+                            M[0] = 1.0
+                            per_env_rollouts[idx].append((S_feat, C_feats, M, 0, 0.0, 0.0, loss_reward, 1.0))
 
-                # Now flush this env’s trajectory as one contiguous block
-                env_active[idx] = False
-                for (S_, C_, M_, A_, LP_, V_, R_, D_) in per_env_rollouts[idx]:
-                    agent_obj.buffer.push(S_, C_, M_, A_, LP_, V_, R_, D_)
-                per_env_rollouts[idx].clear()
-                if training and not agent_obj.eval_mode and agent_obj.buffer.is_ready():
-                    agent_obj._ppo_update()
+                    # Flush this env's trajectory to buffer
+                    env_active[idx] = False
+                    for (S_, C_, M_, A_, LP_, V_, R_, D_) in per_env_rollouts[idx]:
+                        agent_obj.buffer.push(S_, C_, M_, A_, LP_, V_, R_, D_)
+                    per_env_rollouts[idx].clear()
+                    if training and not agent_obj.eval_mode and agent_obj.buffer.is_ready():
+                        agent_obj._ppo_update()
+                    finished += 1
+                else:
+                    # A2C path: just mark as done
+                    env_active[idx] = False
+                    finished += 1
             else:
                 # Decrement passes
                 passes_left[idx] -= 1
@@ -298,10 +329,11 @@ def select_move_with_lookahead(agent_obj, board_pov, dice, i, k=3):
 
     return possible_moves[best_idx]
 
+
 def play_one_game(agent1, agent2, training=False, commentary=False,
                   use_lookahead=False, lookahead_k=3):
     """Play one game with optional top-k lookahead (now symmetric)."""
-    from ppo_agent import _flip_board, _flip_move
+    from utils import _flip_board, _flip_move
 
     board = backgammon.init_board()
     player = np.random.randint(2) * 2 - 1
