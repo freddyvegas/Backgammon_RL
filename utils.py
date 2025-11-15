@@ -4,6 +4,9 @@ import matplotlib.pyplot as plt
 import backgammon
 import torch
 
+
+STATE_DIM = 24 * 2 * 6 + 4 + 1  # 293
+
 def get_device():
     """
     Automatically detect and return the best available device.
@@ -48,7 +51,13 @@ def one_hot_encoding(board29, nSecondRoll: bool):
     returns: np.float32 shape (nx,)
     nx = 24 * 2 * 6 + 4 + 1  # = 293
     """
+    # Fast path: handle torch tensors via the torch implementation
+    if torch.is_tensor(board29):
+        # Use torch encoder and round-trip to NumPy for legacy code
+        return one_hot_encoding_torch(board29, nSecondRoll).cpu().numpy()
+
     oneHot = np.zeros(24 * 2 * 6 + 4 + 1, dtype=np.float32)
+
     # +1 side bins
     for i in range(0, 5):
         idx = np.where(board29[1:25] == i)[0] - 1
@@ -71,7 +80,49 @@ def one_hot_encoding(board29, nSecondRoll: bool):
     oneHot[12 * 24 + 2] = board29[27]
     oneHot[12 * 24 + 3] = board29[28]
     oneHot[12 * 24 + 4] = 1.0 if nSecondRoll else 0.0
+
     return oneHot
+
+def one_hot_encoding_torch(board29_t, nSecondRoll):
+    if not torch.is_tensor(board29_t):
+        board29_t = torch.as_tensor(board29_t, dtype=torch.float32)
+    else:
+        board29_t = board29_t.to(dtype=torch.float32)
+    device = board29_t.device
+
+    pts = board29_t[..., 1:25]  # (..., 24)
+    out_shape = board29_t.shape[:-1] + (STATE_DIM,)
+    out = torch.zeros(out_shape, device=device, dtype=torch.float32)
+
+    # +1 side
+    for i in range(5):
+        mask = (pts == float(i)).to(torch.float32)
+        out[..., i * 24:(i + 1) * 24] = mask
+    mask_ge5_pos = (pts >= 5).to(torch.float32)
+    out[..., 5 * 24:6 * 24] = mask_ge5_pos
+
+    # -1 side
+    neg_pts = -pts
+    base = 6 * 24
+    for i in range(5):
+        mask = (neg_pts == float(i)).to(torch.float32)
+        out[..., base + i * 24:base + (i + 1) * 24] = mask
+    mask_ge5_neg = (neg_pts >= 5).to(torch.float32)
+    out[..., base + 5 * 24:base + 6 * 24] = mask_ge5_neg
+
+    # bars/offs
+    out[..., 12 * 24 + 0] = board29_t[..., 25]
+    out[..., 12 * 24 + 1] = board29_t[..., 26]
+    out[..., 12 * 24 + 2] = board29_t[..., 27]
+    out[..., 12 * 24 + 3] = board29_t[..., 28]
+
+    # second-roll flag
+    flag = torch.as_tensor(float(nSecondRoll), device=device, dtype=torch.float32)
+    if flag.shape != out.shape[:-1]:
+        flag = flag.expand(out.shape[:-1])
+    out[..., 12 * 24 + 4] = flag
+
+    return out
 
 
 # --- Checkpoint helpers ---
@@ -109,14 +160,13 @@ def plot_perf(perf_data, start, end, n_epochs, title="Training progress", timest
             xs = np.arange(start, end+1, n_epochs)
             ax.plot(xs, data, marker='o', label=label, linewidth=2)
 
-    ax.set_xlabel("Evaluation Checkpoint", fontsize=12)
+    ax.set_xlabel("Games played", fontsize=12)
     ax.set_ylabel("Win Rate (%)", fontsize=12)
     ax.set_title(title, fontsize=14, fontweight='bold')
     ax.legend(fontsize=10)
     ax.grid(True, alpha=0.3)
     plt.tight_layout()
-    
-    plot_name = f"training_plot_{timestamp}.png" 
+    plot_name = f"training_plot_{timestamp}.png"
     plt.savefig(plot_name)
     print(f"Training plot saved to {plot_name}")
 
@@ -144,3 +194,121 @@ def flip_to_pov_plus1(board: np.ndarray, player: int) -> np.ndarray:
     out[27] = -b[28]   # +1 borne-off gets what was -1's borne-off
     out[28] = -b[27]
     return out
+
+def append_token(histories293, hist_lens, idx, board29, nSecondRoll_flag, one_hot_encoding_fn):
+    """
+    Append a new 293-dim token to the per-environment history.
+
+    Args:
+        histories293: list[list[np.ndarray(293,)]]
+            Global per-env list of token sequences.
+        hist_lens: list[int]
+            Parallel list of current sequence lengths.
+        idx: int
+            Environment index to update.
+        board29: np.ndarray (29,)
+            Current +1 POV board representation.
+        nSecondRoll_flag: bool
+            Whether this token should include the 'second roll' context bit.
+        one_hot_encoding_fn: callable(board29, nSecondRoll_flag) -> np.ndarray(293,)
+    """
+    token = one_hot_encoding_fn(board29.astype(np.float32), nSecondRoll_flag)
+    if hist_lens[idx] == 0 or not np.array_equal(histories293[idx][-1], token):
+        histories293[idx].append(token)
+        hist_lens[idx] += 1
+
+def append_token_torch(histories293, hist_lens, idx, board29, nSecondRoll_flag, device=None):
+    board29_t = torch.as_tensor(board29, dtype=torch.float32, device=device)
+    token = one_hot_encoding_torch(board29_t, nSecondRoll_flag)  # (293,)
+
+    if hist_lens[idx] == 0 or not torch.equal(histories293[idx][-1], token):
+        histories293[idx].append(token)
+        hist_lens[idx] += 1
+
+
+def pad_truncate_seq(seq_list, max_seq_len, state_dim):
+    """
+    Pad or truncate a list of 293-d tokens into a (max_seq_len, state_dim) array.
+
+    Args:
+        seq_list: list[np.ndarray(293,)] — tokenized state history.
+        max_seq_len: int — maximum sequence length.
+        state_dim: int — feature dimension per token (usually 293).
+
+    Returns:
+        seq_padded: np.ndarray (max_seq_len, state_dim)
+        seq_len: int — number of valid tokens (after truncation).
+    """
+    L = len(seq_list)
+    take = min(L, max_seq_len)
+    seq_padded = np.zeros((max_seq_len, state_dim), dtype=np.float32)
+    if take > 0:
+        seq_slice = np.stack(seq_list[L - take:L], axis=0).astype(np.float32)
+        seq_padded[:take, :] = seq_slice
+    else:
+        seq_padded[0, :] = np.zeros((state_dim,), dtype=np.float32)
+        take = 1
+    return seq_padded, take
+
+def pad_truncate_seq_torch(history_tokens, N, D):
+    """
+    history_tokens: list[torch.Tensor(293,)]
+    Returns: (seq_padded_np[N, D], seq_len)
+    """
+    import numpy as np
+
+    L = len(history_tokens)
+    seq_len = min(L, N)
+
+    seq = torch.zeros((N, D), dtype=torch.float32)
+    if seq_len > 0:
+        seq[-seq_len:] = torch.stack(history_tokens[-seq_len:], dim=0)
+
+    return seq.cpu().numpy(), seq_len
+
+
+def build_histories_batch(histories293, hist_lens):
+    """
+    Build a padded batch (B, L_max, D) and corresponding length vector (B,)
+    from per-env histories. Used before batch_score calls.
+
+    Args:
+        histories293: list[list[np.ndarray(293,)]]
+        hist_lens: list[int]
+
+    Returns:
+        hist_pad: np.ndarray (B, L_max, 293)
+        hist_len: np.ndarray (B,)
+    """
+    B = len(histories293)
+    D = histories293[0][0].shape[-1] if histories293[0] else 293
+    L_max = max(1, max(hist_lens))
+    hist_pad = np.zeros((B, L_max, D), dtype=np.float32)
+    for i in range(B):
+        L_i = hist_lens[i]
+        if L_i > 0:
+            seq_i = np.stack(histories293[i], axis=0).astype(np.float32)
+            hist_pad[i, :L_i, :] = seq_i
+    return hist_pad, np.asarray(hist_lens, dtype=np.int64)
+
+def build_histories_batch_torch(h_batch, h_lens, device=None):
+    B = len(h_batch)
+    if B == 0:
+        return torch.zeros(0, 1, STATE_DIM), torch.zeros(0, dtype=torch.long)
+
+    L_max = max(1, max(h_lens))
+    D = STATE_DIM
+    if device is None:
+        device = h_batch[0][0].device
+
+    hist_pad = torch.zeros((B, L_max, D), dtype=torch.float32, device=device)
+    hist_len = torch.as_tensor(h_lens, dtype=torch.long, device=device)
+
+    for i in range(B):
+        L_i = h_lens[i]
+        if L_i > 0:
+            seq_i = torch.stack(h_batch[i], dim=0).to(device=device, dtype=torch.float32)
+            hist_pad[i, :L_i, :] = seq_i
+
+    return hist_pad, hist_len
+

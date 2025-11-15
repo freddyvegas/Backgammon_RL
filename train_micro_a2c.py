@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-PPO Training Script with MPS Support - FIXED VERSION
+Micro-A2C Training Script - Adapted from PPO training script
 
-Support for small/medium/large model sizes
-- Small: ~80K params, 5-10x faster, great for CPU testing
-- Medium: ~400K params, 2-3x faster, good for T4 GPU or M1/M2 Mac
-- Large: ~1.6M params, best performance, needs good GPU
-
-Device support: CUDA > MPS > CPU (auto-detected)
+Key changes from PPO version:
+1. Import agent_ac_adv_micro instead of ppo_agent
+2. Remove PPO-specific config adjustments (ppo_epochs, entropy_min)
+3. Update OpponentPool agent_module_name to "agent_ac_adv_micro"
+4. Adjust print statements to reference A2C instead of PPO
+5. Remove rollout buffer references (A2C updates immediately)
 """
 
 import numpy as np
@@ -20,7 +20,6 @@ import os
 import random
 import torch
 import torch.nn.functional as F
-torch.backends.cudnn.benchmark = True
 import argparse
 import importlib
 from dataclasses import dataclass, field
@@ -30,11 +29,10 @@ import backgammon
 import pubeval_player as pubeval
 import random_player as randomAgent
 import flipped_agent as flipped_util
-import ppo_agent as agent
-import ppo_transformer_agent as transformer_agent
+import a2c_micro_agent as agent  # CHANGED: import micro-A2C agent
 from opponent_pool import OpponentPool
-from utils import _ensure_dir, _safe_save_agent, plot_perf, _is_empty_move, _apply_move_sequence, flip_to_pov_plus1, flip_to_pov_plus1, get_device
-from play_games import play_games_batched, play_games_batched_transformer
+from utils import _ensure_dir, _safe_save_agent, plot_perf, _is_empty_move, _apply_move_sequence, flip_to_pov_plus1, get_device
+from play_games import play_games_batched
 from evaluate import evaluate, CheckpointLeague
 
 # Set seeds for reproducibility
@@ -47,6 +45,9 @@ if torch.cuda.is_available():
 
 # Local checkpoint directory
 CHECKPOINT_DIR = "./checkpoints"
+BATCH_SIZE = 8  # or 16/32 for more parallel games
+
+print(f"Batch self-play games: {BATCH_SIZE} games in parallel")
 
 # =========================
 # Core training structures
@@ -62,7 +63,6 @@ class TrainingState:
     n_epochs: int
     n_eval: int
     start_step: int
-    batch_size: int
     use_opponent_pool: bool
     pool_snapshot_every: int
     pool_max_size: int
@@ -75,7 +75,6 @@ class TrainingState:
     league_checkpoint_every: int
     n_eval_league: int
     timestamp: str
-    agent_type: str
 
     # Curriculum tuning
     pool_start_games: int = 5_000
@@ -83,7 +82,7 @@ class TrainingState:
     pool_target_rate: float = 0.30
 
     # Mutable runtime state
-    agent_instance: "agent.PPOAgent" = None
+    agent_instance: "agent.MicroA2CAgent" = None  # CHANGED: type annotation
     checkpoint_base_path: Path = None
     best_ckpt_path: Path = None
     latest_ckpt_path: Path = None
@@ -133,12 +132,10 @@ def initialize_training(
     league_checkpoint_every=20_000,
     n_eval_league=50,
     device='cpu',
-    agent_type='MLP',
-    resume=None,
-    batch_size=8
+    resume=None
 ) -> TrainingState:
     print("\n" + "=" * 70)
-    print("PPO TRAINING")
+    print("MICRO-A2C TRAINING")  # CHANGED: title
     print("=" * 70)
     print(f"Model size: {model_size.upper()}")
     print(f"Total games: {n_games:,}")
@@ -149,15 +146,10 @@ def initialize_training(
     print(f"Device: {device}")
     print("=" * 70 + "\n")
 
-    # Agent + gentle curriculum tweaks
-    if agent_type ==  'transformer':
-        cfg = transformer_agent.get_config(model_size)
-        agent_instance = transformer_agent.PPOAgent(config=cfg, device=device)
-    else:
-        cfg = agent.get_config(model_size)
-        agent_instance = agent.PPOAgent(config=cfg, device=device)
-
-
+    # Agent initialization - NO PPO-specific config tweaks
+    cfg = agent.get_config(model_size)
+    agent_instance = agent.MicroA2CAgent(config=cfg, device=device)  # CHANGED: MicroA2CAgent
+    
     if resume is not None:
        agent_instance.load(resume)
 
@@ -167,7 +159,7 @@ def initialize_training(
     checkpoint_base_path = Path(CHECKPOINT_DIR)
     _ensure_dir(checkpoint_base_path)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    agent.CHECKPOINT_PATH = checkpoint_base_path / f"best_ppo_{model_size}_{timestamp}.pt"
+    agent.CHECKPOINT_PATH = checkpoint_base_path / f"best_micro_a2c_{model_size}_{timestamp}.pt"  # CHANGED: filename
     best_ckpt_path = checkpoint_base_path / f"best_so_far_{model_size}_{timestamp}.pt"
     latest_ckpt_path = checkpoint_base_path / f"latest_{model_size}_{timestamp}.pt"
 
@@ -177,7 +169,7 @@ def initialize_training(
         pool_dir = checkpoint_base_path / f"opponent_pool_{model_size}"
         opponent_pool = OpponentPool(
             pool_dir=pool_dir,
-            agent_module_name="ppo_agent",
+            agent_module_name="agent_ac_adv_micro",  # CHANGED: module name
             max_size=pool_max_size,
             seed=RANDOM_SEED,
             device=device
@@ -198,7 +190,7 @@ def initialize_training(
             print(f"\n{'='*60}")
             print("SEEDING OPPONENT POOL")
             print(f"{'='*60}")
-            latest_path = agent.CHECKPOINT_PATH.parent / f"latest_ppo_{model_size}.pt"
+            latest_path = agent.CHECKPOINT_PATH.parent / f"latest_micro_a2c_{model_size}.pt"  # CHANGED: filename
             agent_instance.save(str(latest_path))
             opponent_pool.add_snapshot(latest_path, label="(seed at 0 games)")
             print(f"✓ Seed snapshot added")
@@ -209,7 +201,7 @@ def initialize_training(
     # League
     league = CheckpointLeague(
         checkpoint_dir=checkpoint_base_path / f"league_{model_size}",
-        agent_module_name="ppo_agent"
+        agent_module_name="agent_ac_adv_micro"  # CHANGED: module name
     )
 
     # Baseline
@@ -218,7 +210,7 @@ def initialize_training(
     state = TrainingState(
         # Static / config
         model_size=model_size, device=device, eval_vs=eval_vs,
-        n_games=n_games, n_epochs=n_epochs, n_eval=n_eval, batch_size=batch_size,
+        n_games=n_games, n_epochs=n_epochs, n_eval=n_eval,
         start_step=start_step, use_opponent_pool=use_opponent_pool,
         pool_snapshot_every=pool_snapshot_every,
         pool_max_size=pool_max_size,
@@ -231,7 +223,6 @@ def initialize_training(
         league_checkpoint_every=league_checkpoint_every,
         n_eval_league=n_eval_league,
         timestamp=timestamp,
-        agent_type=agent_type,
 
         # Runtime
         agent_instance=agent_instance,
@@ -259,9 +250,7 @@ def initialize_training(
     print(f"Total games: {state.n_games:,}")
     print(f"{'='*60}\n")
 
-    # Optional warm start
-    if state.use_bc_warmstart:
-        agent.warmstart_with_pubeval(batch_iter, epochs=3, assume_second_roll=False)
+    # Note: No BC warmstart for A2C (TD(λ) learning is different)
 
     return state
 
@@ -295,8 +284,8 @@ def train_step(state: TrainingState, train_bar: tqdm):
         bias_recent = state.games_done >= state.pool_ramp_end
         if random.random() < 0.5 and state.best_ckpt_path.exists():
             try:
-                agent_mod = importlib.import_module("ppo_agent")
-                opponent = agent_mod.PPOAgent(device=state.device)
+                agent_mod = importlib.import_module("agent_ac_adv_micro")  # CHANGED: module name
+                opponent = agent_mod.MicroA2CAgent(device=state.device)  # CHANGED: class name
                 opponent.load(str(state.best_ckpt_path), map_location=state.device, load_optimizer=False)
                 opponent.set_eval_mode(True)
                 opponent_type = 'pool_best'
@@ -318,10 +307,7 @@ def train_step(state: TrainingState, train_bar: tqdm):
         opponent_type = 'self_play'
 
     # Play batch
-    if state.agent_type == 'transformer':
-        finished = play_games_batched_transformer(ai, opponent, batch_size=state.batch_size, training=True)
-    else:
-        finished = play_games_batched(ai, opponent, batch_size=state.batch_size, training=True)
+    finished = play_games_batched(ai, opponent, batch_size=BATCH_SIZE, training=True)
     if state.games_done + finished > state.n_games:
         finished = state.n_games - state.games_done
 
@@ -333,14 +319,14 @@ def train_step(state: TrainingState, train_bar: tqdm):
     # Progress bar postfix
     if state.games_done % 100 == 0 or state.games_done == state.n_games:
         postfix = {"steps": f"{ai.steps:,}", "upd": ai.updates}
-        if hasattr(ai, 'rollout_stats'):
-            stats = ai.rollout_stats
-            if stats['policy_loss']:
-                postfix["πL"] = f"{stats['policy_loss'][-1]:.3f}"
-            if stats['value_loss']:
-                postfix["VL"] = f"{stats['value_loss'][-1]:.3f}"
-            if stats['grad_norm']:
-                postfix["∇"] = f"{stats['grad_norm'][-1]:.2f}"
+        if hasattr(ai, 'stats'):  # CHANGED: A2C uses 'stats' not 'rollout_stats'
+            stats = ai.stats
+            if stats['td_errors']:
+                postfix["δ"] = f"{np.mean(stats['td_errors'][-100:]):.4f}"
+            if stats['values']:
+                postfix["V"] = f"{np.mean(stats['values'][-100:]):.3f}"
+            if stats['entropy']:
+                postfix["H"] = f"{np.mean(stats['entropy'][-100:]):.3f}"
 
         total_opp_games = sum(state.opponent_stats.values())
         if total_opp_games > 0:
@@ -356,7 +342,7 @@ def train_step(state: TrainingState, train_bar: tqdm):
         print(f"SNAPSHOT CHECKPOINT at {state.games_done:,} games")
         print(f"{'='*60}")
 
-        latest_path = state.checkpoint_base_path / f"latest_ppo_{state.model_size}.pt"
+        latest_path = state.checkpoint_base_path / f"latest_micro_a2c_{state.model_size}.pt"  # CHANGED: filename
         ai.save(str(latest_path))
 
         if not latest_path.exists():
@@ -422,7 +408,7 @@ def validation_step(state: TrainingState):
         if wr > state.best_wr:
             state.best_wr = wr
             ai.save(str(state.best_ckpt_path))
-            print(f"  🌟 NEW BEST vs pubeval: {wr:.1f}% (saved to {state.best_ckpt_path.name})")
+            print(f"  🌟 NEW BEST vs {state.eval_vs}: {wr:.1f}% (saved to {state.best_ckpt_path.name})")
 
         if state.use_eval_lookahead:
             wr_lookahead = evaluate(ai, state.baseline, min(100, state.n_eval),
@@ -466,9 +452,7 @@ def train(
     league_checkpoint_every=20_000,
     n_eval_league=50,
     device='cpu',
-    agent_type='MLP',
-    resume=None,
-    batch_size=8
+    resume=None
 ):
     # Initialize
     state = initialize_training(
@@ -479,13 +463,12 @@ def train(
         random_sample_rate=random_sample_rate, use_eval_lookahead=use_eval_lookahead,
         eval_lookahead_k=eval_lookahead_k, use_bc_warmstart=use_bc_warmstart,
         league_checkpoint_every=league_checkpoint_every, n_eval_league=n_eval_league,
-        device=device, agent_type=agent_type, resume=resume, batch_size=batch_size
+        device=device, resume=resume
     )
 
     # Validate initial model
     validation_step(state)
 
-    print(f"Training on {args.batch_size} games in parallel")
     # Training loop
     train_bar = tqdm(total=state.n_games, desc="Training", unit="game")
     try:
@@ -517,26 +500,27 @@ def train(
 
     ai = state.agent_instance
     print()
-    print("Final PPO State:")
+    print("Final Micro-A2C State:")  # CHANGED: title
     print(f"  Updates: {ai.updates}")
     print(f"  Steps: {ai.steps}")
     print(f"  Entropy coef: {ai.current_entropy_coef:.4f}")
 
-    if hasattr(ai, 'rollout_st0ts'):
-        stats = ai.rollout_stats
-        if stats['nA_values']:
-            print(f"  Avg legal actions: {np.mean(stats['nA_values'][-1000:]):.1f}")
-        if stats['masked_entropy']:
-            print(f"  Final entropy: {np.mean(stats['masked_entropy'][-10:]):.4f}")
+    if hasattr(ai, 'stats'):  # CHANGED: stats structure
+        stats = ai.stats
+        if stats['td_errors']:
+            print(f"  Avg TD error: {np.mean(stats['td_errors'][-1000:]):.4f}")
+        if stats['entropy']:
+            print(f"  Final entropy: {np.mean(stats['entropy'][-100:]):.4f}")
 
     print("=" * 70)
 
-    plot_perf(state.perf_data, 0, n_games, n_epochs, title=f"PPO Training ({state.model_size.upper()} model)", timestamp=state.timestamp)
-
+    plot_perf(state.perf_data, 0, n_games, n_epochs, 
+              title=f"Micro-A2C Training ({state.model_size.upper()} model)",  # CHANGED: title
+              timestamp=state.timestamp)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description='Train PPO agent for backgammon')
+    parser = argparse.ArgumentParser(description='Train Micro-A2C agent for backgammon')  # CHANGED: description
     parser.add_argument('--model-size', type=str, default='large',
                        choices=['small', 'medium', 'large'],
                        help='Model size: small (CPU), medium (M1/M2/T4 GPU), large (good GPU)')
@@ -544,14 +528,10 @@ if __name__ == "__main__":
                        help='Total number of training games')
     parser.add_argument('--n-epochs', type=int, default=5_000,
                        help='Evaluate every N games')
-    parser.add_argument('--batch-size', type=int, default=8,
-                       help='Training batch size')
     parser.add_argument('--cpu-test', action='store_true',
                        help='Quick test: small model, 10k games, frequent evals')
     parser.add_argument('--device', type=str, default='cpu',
-                        help='Device type to train on')
-    parser.add_argument('--agent-type', type=str, default='MLP',
-                        help='Agent type to train')
+                       help='Device to use for training')
     parser.add_argument('--resume', type=Path, default=None,
                         help='Path to a .pt checkpoint to resume training from')
     args = parser.parse_args()
@@ -562,28 +542,28 @@ if __name__ == "__main__":
         print("CPU TEST MODE")
         print("=" * 70)
         print("  Model: small")
-        print("  Games: 50,000")
-        print("  Eval every: 5,000 games")
-        print("  Eval games: 200")
+        print("  Games: 10,000")
+        print("  Eval every: 2,500 games")
+        print("  Eval games: 100")
         print("  Baseline: pubeval")
-        print("  Lookahead: enabled")
+        print("  Lookahead: disabled")
         print("=" * 70 + "\n")
 
         train(
             n_games=10_000,
-            n_epochs=5_000,
-            n_eval=200,
+            n_epochs=2_500,
+            n_eval=100,
             eval_vs="pubeval",
             model_size='small',
-            use_opponent_pool=False,  # DISABLED - build competence first!
+            use_opponent_pool=False,  # Start without pool
             pool_snapshot_every=5_000,
-            pubeval_sample_rate=0.20,  # 20% pubeval exposure
-            random_sample_rate=0.20,   # 20% random for robustness
-            use_eval_lookahead=True,
+            pubeval_sample_rate=0.30,  # 30% pubeval exposure
+            random_sample_rate=0.10,   # 10% random for robustness
+            use_eval_lookahead=False,  # Faster testing
             eval_lookahead_k=3,
-            use_bc_warmstart=False,  # Jump-start with pubeval imitation
+            use_bc_warmstart=False,
             league_checkpoint_every=10_000,
-            device='cpu',
+            device=args.device,
         )
     else:
         train(
@@ -595,13 +575,11 @@ if __name__ == "__main__":
             use_opponent_pool=True,
             pool_snapshot_every=5_000,
             pool_max_size=12,
-            pool_sample_rate=0.40,      # 90% pool (self-play curriculum)
-            pubeval_sample_rate=0.10,   # 10% pubeval (strong baseline)
-            random_sample_rate=0.00,    # 0% random (robustness only)
+            pool_sample_rate=0.40,      # 40% pool (self-play curriculum)
+            pubeval_sample_rate=0.30,   # 30% pubeval (strong baseline)
+            random_sample_rate=0.30,    # 30% random (robustness)
             use_eval_lookahead=False,
             eval_lookahead_k=3,
-            device = args.device,
-            agent_type = args.agent_type,
-            resume = args.resume,
-            batch_size = args.batch_size
+            device=args.device,
+            resume=args.resume
         )
