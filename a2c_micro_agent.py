@@ -213,6 +213,46 @@ def build_legality_mask(board29: np.ndarray, die_value: int, player: int = 1) ->
     return mask
 
 
+def build_legality_mask_multi(board29: np.ndarray,
+                              dice_remaining: List[int],
+                              player: int = 1) -> np.ndarray:
+    """
+    Build 156-dimensional legality mask for the current dice multiset D_t.
+
+    Args:
+        board29: Board state (length 29) from player's POV (+1)
+        dice_remaining: list of remaining dice values, e.g. [3, 5] or [4,4,4,4]
+        player: Player (+1 or -1), should be +1 in POV
+
+    Returns:
+        mask: np.ndarray of shape (156,) with 1.0 for legal, 0.0 for illegal
+
+    Semantics:
+      - For each die d in dice_remaining, all legal (src, d) get mask=1.
+      - If *no* legal move exists for *any* die, then for each distinct die
+        we mark the no-op (src=0, that die) as legal.
+    """
+    mask = np.zeros(156, dtype=np.float32)
+
+    any_legal = False
+    for die in dice_remaining:
+        legal_moves = backgammon.legal_move(board29, die, player)
+        if len(legal_moves) == 0:
+            continue
+        any_legal = True
+        for move in legal_moves:
+            src = int(move[0])
+            action_idx = encode_micro_action(src, die)
+            mask[action_idx] = 1.0
+
+    if not any_legal:
+        # No legal move for *any* die: only no-ops for each distinct die
+        for die in set(dice_remaining):
+            mask[encode_micro_action(0, die)] = 1.0
+
+    return mask
+
+
 # ============================================================================
 # Network Architecture
 # ============================================================================
@@ -357,7 +397,7 @@ class TDLambdaTraces:
             alpha_critic: Critic learning rate
         """
         for name, param in self.acnet.named_parameters():
-            if 'value' in name and param.grad is not None:
+            if ('value_head' in name or 'state_enc' in name or 'blocks' in name) and param.grad is not None:
                 # Update trace: e = λ * e + ∇V
                 self.critic_traces[name].mul_(self.lambda_val).add_(param.grad.data)
                 
@@ -376,7 +416,7 @@ class TDLambdaTraces:
             alpha_actor: Actor learning rate
         """
         for name, param in self.acnet.named_parameters():
-            if 'actor' in name and param.grad is not None:
+            if ('actor_head' in name or 'state_enc' in name or 'blocks' in name) and param.grad is not None:
                 # Update trace: e = λ * e + ∇log π
                 self.actor_traces[name].mul_(self.lambda_val).add_(param.grad.data)
                 
@@ -440,7 +480,7 @@ class MicroA2CAgent:
         Returns:
             features: np.ndarray of shape (293,)
         """
-        return one_hot_encoding(board29.astype(np.float32), False)
+        return one_hot_encoding(board29.astype(np.float32), is_second_roll)
     
     def select_micro_action(self, state_features, mask, training=True):
         """
@@ -484,41 +524,39 @@ class MicroA2CAgent:
             log_prob = 0.0
         
         return action_idx, log_prob, value
-    
-    def _apply_micro_action(self, board29, action_idx, die_value):
+
+    def _apply_micro_action(self, board29, action_idx):
         """
-        Apply a single micro-action to the board.
-        
+        Apply a single micro-action (src, die) to the board.
+
         Args:
             board29: Current board state
-            action_idx: Micro-action index
-            die_value: Die value being used
-        
+            action_idx: Micro-action index (encodes both src and die)
+
         Returns:
             next_board: Board after applying action
-            is_noop: True if action was no-op
+            is_noop: True if action was no-op (src=0)
         """
-        src, _ = decode_micro_action(action_idx)
-        
+        src, die_value = decode_micro_action(action_idx)
+
         if src == 0:
-            # No-op: no move possible
+            # No-op: die is effectively dead, board unchanged
             return board29.copy(), True
-        
+
         # Get legal moves for this die to find destination
         legal_moves = backgammon.legal_move(board29, die_value, player=1)
-        
-        # Find the move matching this source
+
         move = None
         for m in legal_moves:
             if int(m[0]) == src:
                 move = m
                 break
-        
+
         if move is None:
             # Should not happen if mask is correct
             print(f"[WARNING] No legal move found for src={src}, die={die_value}")
             return board29.copy(), True
-        
+
         # Apply the move
         next_board = backgammon.update_board(board29, move.reshape(1, 2), player=1)
         return next_board, False
@@ -526,80 +564,76 @@ class MicroA2CAgent:
     def micro_rollout_turn(self, board29, dice, training=True):
         """
         Execute a complete turn as a sequence of micro-steps.
-        
+
         Args:
             board29: Initial board state from +1 POV
             dice: Dice roll (length 2)
             training: If True, collect trajectory for learning
-        
+
         Returns:
             trajectory: List of micro-step transitions
             final_board: Board state after turn
             full_move: Complete move sequence (for compatibility)
         """
-        # Each call is responsible for at most two micro-steps
-        dice_remaining = [dice[0], dice[1]]
-        
-        # Compute is_doubles once for this turn (Bug 2 fix)
-        is_doubles = (dice[0] == dice[1])
- 
+        # Doubles: four dice; otherwise: two dice
+        if dice[0] == dice[1]:
+            dice_remaining = [dice[0]] * 4
+            is_doubles = True
+        else:
+            dice_remaining = [dice[0], dice[1]]
+            is_doubles = False
+
         trajectory = []
         current_board = board29.copy()
-        move_sequence = []  # Track moves for reconstruction
-        micro_step = 0  # Track which micro-step we're on
-        
+        move_sequence = []  # Track actual moves (src,dst) for reconstruction
+        micro_step = 0      # Micro-step index within this turn
+
         while dice_remaining:
-            die = dice_remaining[0]
-            
-            # Build legality mask
-            mask = build_legality_mask(current_board, die, player=1)
-            
-            # Check if only no-op is legal (Bug 3 already fixed)
-            only = np.flatnonzero(mask == 1.0)
-            if len(only) == 1:
-                src, _ = decode_micro_action(int(only[0]))
-                if src == 0:
-                    # This die is effectively dead, drop it and try the next one
-                    dice_remaining.pop(0)
-                    micro_step += 1
-                    continue
-           
-            # Encode state with correct second_roll flag (Bug 2 fix)
+            # Build legality mask over ALL remaining dice
+            mask = build_legality_mask_multi(current_board, dice_remaining, player=1)
+
+            # Encode state with correct second-roll flag:
             # True only for doubles AND first micro-step
             is_second_roll = is_doubles and (micro_step == 0)
-            state_features = self._encode_state(current_board, False)
-            
-            # Select action
+            state_features = self._encode_state(current_board, is_second_roll)
+
+            # Select action (src, die) from masked policy over all dice
             action_idx, log_prob, value = self.select_micro_action(
                 state_features, mask, training=training
             )
-            
-            # Apply action
-            next_board, is_noop = self._apply_micro_action(current_board, action_idx, die)
-            
-            # Record move for reconstruction (if not no-op)
+
+            # Decode to know which die was actually used
+            src, die_value = decode_micro_action(action_idx)
+
+            # Apply micro-action
+            next_board, is_noop = self._apply_micro_action(current_board, action_idx)
+
+            # Record actual (src,dst) move if not no-op
             if not is_noop:
-                src, _ = decode_micro_action(action_idx)
-                # Find actual destination from legal moves
-                legal = backgammon.legal_move(current_board, die, player=1)
+                legal = backgammon.legal_move(current_board, die_value, player=1)
                 for m in legal:
                     if int(m[0]) == src:
-                        # Store as (2,) array
                         move_sequence.append(np.array([m[0], m[1]], dtype=np.int32))
                         break
-            
-            # Remove die from remaining
-            dice_remaining.pop(0)
+
+            # Remove ONE occurrence of that die from remaining dice
+            try:
+                die_idx = dice_remaining.index(die_value)
+                dice_remaining.pop(die_idx)
+            except ValueError:
+                # Should not happen if mask and decode are consistent
+                print(f"[WARNING] Die {die_value} not in dice_remaining={dice_remaining}")
+                dice_remaining.pop(0)  # fallback: drop first
             micro_step += 1
-            
-            # Compute reward - check terminal state every micro-step (Bug 4 fix)
+
+            # Compute reward / terminal transition at every micro-step
             done = backgammon.game_over(next_board)
             reward = 0.0
             if done:
                 # +1 for win, -1 for loss (from +1 POV)
                 reward = 1.0 if next_board[27] == 15 else -1.0
-            
-            # Store transition
+
+            # Store transition (including noop steps!)
             if training:
                 trajectory.append({
                     'state': state_features,
@@ -611,22 +645,23 @@ class MicroA2CAgent:
                     'done': done,
                     'board': current_board.copy(),
                 })
-            
+
             current_board = next_board
-            
-            # Break if game is over
+
+            # Break early if game is over
             if done:
                 break
-        
+
         # Reconstruct full move - ensure compatible format with backgammon.py
         if len(move_sequence) == 0:
             full_move = np.empty((0, 2), dtype=np.int32)
         elif len(move_sequence) == 1:
             full_move = move_sequence[0].reshape(1, 2)
         else:
-            # At most 2 moves per call
-            full_move = np.vstack(move_sequence[:2]).reshape(2, 2)
- 
+            # At most 4 moves per doubles turn, but train.py expects <=2 per call.
+            # Keep first two moves for compatibility.
+            full_move = np.vstack(move_sequence[:2]).reshape(-1, 2)
+
         return trajectory, current_board, full_move
     
     def td_lambda_update(self, trajectory):
@@ -691,12 +726,12 @@ class MicroA2CAgent:
             # Actor loss (negative for gradient ascent)
             actor_loss = log_prob + self.current_entropy_coef * entropy
             actor_loss.backward()
+
+            # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(self.acnet.parameters(), self.config.max_grad_norm)
             
             # Apply actor update with traces
             self.traces.update_actor(td_error, self.config.lr_actor)
-            
-            # Gradient clipping
-            torch.nn.utils.clip_grad_norm_(self.acnet.parameters(), self.config.max_grad_norm)
             
             # Track stats
             self.stats['td_errors'].append(td_error)
