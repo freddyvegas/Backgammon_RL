@@ -38,8 +38,8 @@ class Config:
     n_micro_actions = 156  # 26 sources × 6 dice
     
     # Learning rates
-    lr_critic = 1e-4
-    lr_actor = 1e-4
+    lr_critic = 1e-5
+    lr_actor = 1e-5
     
     # TD(λ) parameters
     gamma = 1.0  # discount factor (as specified in PDF)
@@ -448,6 +448,11 @@ class MicroA2CAgent:
         
         # Eligibility traces
         self.traces = TDLambdaTraces(self.acnet, lambda_val=self.config.lambda_td)
+
+        # Expose trace dictionaries for direct access
+        self.critic_traces = self.traces.critic_traces
+        self.actor_traces = self.traces.actor_traces
+        self.lambda_val = self.traces.lambda_val 
         
         # Training state
         self.steps = 0
@@ -681,9 +686,31 @@ class MicroA2CAgent:
             mask = transition['mask']
             reward = transition['reward']
             done = transition['done']
-            value = transition['value']
+            #value = transition['value']
+
+            # Convert to tensors
+            state_t = torch.tensor(state, dtype=torch.float32, device=self.device).unsqueeze(0)
+            mask_t = torch.tensor(mask, dtype=torch.float32, device=self.device).unsqueeze(0)
             
-            # Get next value
+            # ============================================================
+            # STEP 1: Compute V(sₜ) with gradients for trace update
+            # ============================================================
+            self.acnet.zero_grad()
+            _, value_t = self.acnet(state_t, mask_t)
+            value_current = value_t.item()
+            
+            # Compute gradient ∇φVφ(sₜ) for critic trace
+            value_t.backward()
+            
+            # Update CRITIC trace: eᵛₜ = λ eᵛₜ₋₁ + ∇φVφ(sₜ)
+            for name, param in self.acnet.named_parameters():
+                # Only update critic parameters (value_head, and shared trunk)
+                if param.grad is not None and ('value_head' in name or 'state_enc' in name or 'blocks' in name):
+                    self.critic_traces[name].mul_(self.lambda_val).add_(param.grad.data)
+            
+            # ============================================================
+            # STEP 2: Compute V(sₜ₊₁) for TD error
+            # ============================================================
             if done or t == len(trajectory) - 1:
                 next_value = 0.0
             else:
@@ -697,58 +724,72 @@ class MicroA2CAgent:
                     next_value = next_value_t.item()
             
             # TD error: δ = r + γV(s') - V(s)
-            td_error = reward + (0.0 if done else self.config.gamma * next_value) - value
+            td_error = reward + (0.0 if done else self.config.gamma * next_value) - value_current
             
-            # Convert to tensors
-            state_t = torch.tensor(state, dtype=torch.float32, device=self.device).unsqueeze(0)
-            mask_t = torch.tensor(mask, dtype=torch.float32, device=self.device).unsqueeze(0)
+            # ============================================================
+            # STEP 3: Apply critic update: φ ← φ + αc δₜ eᵛₜ
+            # ============================================================
+            for name, param in self.acnet.named_parameters():
+                if 'value_head' in name or 'state_enc' in name or 'blocks' in name:
+                    param.data.add_(self.critic_traces[name], alpha=self.config.lr_critic * td_error)
+            
+            # ============================================================
+            # STEP 4: Compute ∇Θ log πΘ(aₜ | sₜ) for actor trace
+            # ============================================================
             
             # Forward pass (with gradients)
             self.acnet.zero_grad()
-            logits, value_pred = self.acnet(state_t, mask_t)
-            
-            # Critic gradient: ∇V(s)
-            value_pred.backward(retain_graph=True)
-            
-            # Apply critic update with traces
-            self.traces.update_critic(td_error, self.config.lr_critic)
-            
-            # Actor gradient: ∇log π(a|s)
-            self.acnet.zero_grad()
             logits, _ = self.acnet(state_t, mask_t)
-            log_probs = F.log_softmax(logits, dim=-1)
+            log_probs = F.log_softmax(logits.masked_fill(mask_t == 0, -1e9), dim=-1)
             log_prob = log_probs[0, action]
             
             # Add entropy bonus
             probs = F.softmax(logits, dim=-1)
             entropy = -(probs * log_probs).sum()
             
-            # Actor loss (negative for gradient ascent)
-            actor_loss = log_prob + self.current_entropy_coef * entropy
-            actor_loss.backward()
+            # Actor objective (negative for gradient ascent)
+            actor_obj = log_prob + self.current_entropy_coef * entropy
+            actor_obj.backward()
 
-            # Gradient clipping
-            torch.nn.utils.clip_grad_norm_(self.acnet.parameters(), self.config.max_grad_norm)
+            # Update ACTOR trace: eᵖₜ = λ eᵖₜ₋₁ + ∇Θ log πΘ(aₜ | sₜ)
+            for name, param in self.acnet.named_parameters():
+                # Only update actor parameters (actor_head, and shared trunk)
+                if param.grad is not None and ('actor_head' in name or 'state_enc' in name or 'blocks' in name):
+                    self.actor_traces[name].mul_(self.lambda_val).add_(param.grad.data)
+
+            # Gradient clipping on traces (optional but recommended)
+            total_norm = 0.0
+            for trace in self.actor_traces.values():
+                total_norm += trace.norm().item() ** 2
+            total_norm = np.sqrt(total_norm)
             
-            # Apply actor update with traces
-            self.traces.update_actor(td_error, self.config.lr_actor)
+            if total_norm > self.config.max_grad_norm:
+                clip_coef = self.config.max_grad_norm / (total_norm + 1e-6)
+                for trace in self.actor_traces.values():
+                    trace.mul_(clip_coef)
+
+            # ============================================================
+            # STEP 5: Apply actor update: Θ ← Θ + αa δₜ eᵖₜ
+            # ============================================================
+            for name, param in self.acnet.named_parameters():
+                if 'actor_head' in name or 'state_enc' in name or 'blocks' in name:
+                    param.data.add_(self.actor_traces[name], alpha=self.config.lr_actor * td_error)
             
             # Track stats
             self.stats['td_errors'].append(td_error)
-            self.stats['values'].append(value)
+            self.stats['values'].append(value_current)
             self.stats['entropy'].append(entropy.item())
             self.stats['rewards'].append(reward)
             
             self.steps += 1
         
         self.updates += 1
-        
+
         # Decay entropy coefficient
         self.current_entropy_coef = max(
-            self.config.entropy_min,
-            self.current_entropy_coef * self.config.entropy_decay
-        )
-        
+        self.config.entropy_min,
+        self.current_entropy_coef * self.config.entropy_decay
+    )
         # Print stats periodically
         if self.updates % 100 == 0:
             recent_td = np.mean(self.stats['td_errors'][-100:])
@@ -986,4 +1027,5 @@ if __name__ == "__main__":
     print("\n" + "="*70)
     print("TEST COMPLETE")
     print("="*70)
+
 

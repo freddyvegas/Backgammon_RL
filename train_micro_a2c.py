@@ -169,7 +169,7 @@ def initialize_training(
         pool_dir = checkpoint_base_path / f"opponent_pool_{model_size}"
         opponent_pool = OpponentPool(
             pool_dir=pool_dir,
-            agent_module_name="agent_ac_adv_micro",  # CHANGED: module name
+            agent_module_name="a2c_micro_agent",  # CHANGED: module name
             max_size=pool_max_size,
             seed=RANDOM_SEED,
             device=device
