@@ -170,6 +170,54 @@ def plot_perf(perf_data, start, end, n_epochs, title="Training progress", timest
     plt.savefig(plot_name)
     print(f"Training plot saved to {plot_name}")
 
+def plot_perf_multi(perf_data, start_game, n_games, n_epochs, title='Training Performance', timestamp=None):
+    """
+    Plot performance against multiple opponents (pubeval, random, GNU BG).
+    """
+    import matplotlib.pyplot as plt
+    
+    x_vals = list(range(start_game, n_games + 1, n_epochs))
+    
+    fig, ax = plt.subplots(figsize=(10, 6))
+    
+    # Plot vs Pubeval (primary baseline)
+    if 'vs_baseline' in perf_data and len(perf_data['vs_baseline']) > 0:
+        ax.plot(x_vals[:len(perf_data['vs_baseline'])], 
+                perf_data['vs_baseline'], 
+                'o-', label='vs Pubeval', linewidth=2, markersize=6)
+    
+    # Plot vs Random
+    if 'vs_random' in perf_data and len(perf_data['vs_random']) > 0:
+        ax.plot(x_vals[:len(perf_data['vs_random'])], 
+                perf_data['vs_random'], 
+                's-', label='vs Random', linewidth=2, markersize=6)
+    
+    # Plot vs GNU Backgammon
+    if 'vs_gnubg' in perf_data and len(perf_data['vs_gnubg']) > 0:
+        ax.plot(x_vals[:len(perf_data['vs_gnubg'])], 
+                perf_data['vs_gnubg'], 
+                '^-', label='vs GNU BG', linewidth=2, markersize=6)
+    
+    ax.set_xlabel('Games played', fontsize=12)
+    ax.set_ylabel('Win Rate (%)', fontsize=12)
+    ax.set_title(title, fontsize=14, fontweight='bold')
+    ax.legend(loc='best', fontsize=10)
+    ax.grid(True, alpha=0.3)
+    ax.set_ylim(0, 105)
+    
+    plt.tight_layout()
+    
+    # Save with timestamp
+    if timestamp:
+        filename = f'training_plot_{timestamp}.png'
+    else:
+        from datetime import datetime
+        filename = f'training_plot_{datetime.now().strftime("%Y%m%d_%H%M%S")}.png'
+    
+    plt.savefig(filename, dpi=150, bbox_inches='tight')
+    print(f"Training plot saved to {filename}")
+    plt.close()
+
 def _is_empty_move(move):
     if move is None: return True
     if isinstance(move, (list, tuple)): return len(move) == 0
@@ -311,4 +359,5 @@ def build_histories_batch_torch(h_batch, h_lens, device=None):
             hist_pad[i, :L_i, :] = seq_i
 
     return hist_pad, hist_len
+
 
