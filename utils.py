@@ -265,13 +265,19 @@ def append_token(histories293, hist_lens, idx, board29, nSecondRoll_flag, one_ho
         histories293[idx].append(token)
         hist_lens[idx] += 1
 
-def append_token_torch(histories293, hist_lens, idx, board29, nSecondRoll_flag, device=None):
+def append_token_torch(histories293, hist_lens, idx, board29, nSecondRoll_flag, device=None, max_seq_len=None):
+    """Append a tokenized observation to an env history with optional truncation."""
     board29_t = torch.as_tensor(board29, dtype=torch.float32, device=device)
     token = one_hot_encoding_torch(board29_t, nSecondRoll_flag)  # (293,)
 
     if hist_lens[idx] == 0 or not torch.equal(histories293[idx][-1], token):
         histories293[idx].append(token)
         hist_lens[idx] += 1
+        if max_seq_len is not None and hist_lens[idx] > max_seq_len:
+            overflow = hist_lens[idx] - max_seq_len
+            if overflow > 0:
+                del histories293[idx][:overflow]
+                hist_lens[idx] = max_seq_len
 
 
 def pad_truncate_seq(seq_list, max_seq_len, state_dim):
@@ -359,5 +365,4 @@ def build_histories_batch_torch(h_batch, h_lens, device=None):
             hist_pad[i, :L_i, :] = seq_i
 
     return hist_pad, hist_len
-
 
