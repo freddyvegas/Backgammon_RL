@@ -1,28 +1,26 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Micro-move Actor-Critic agent for Backgammon (A2C-Micro)
+Micro-move Actor-Critic agent for Backgammon (Simplified TD(λ) version)
 
-Implementation of Part B from the assignment PDF:
-- Fixed 156-action space (26 sources × 6 dice)
-- Legality masking per micro-step
+Following the instructor's style:
+- Shallow network with raw tensor parameters (w1, b1, w2_actor, b2_actor, w2_critic, b2_critic)
+- Manual parameter updates with eligibility traces
+- Fixed 156-action space with legality masking
 - State-value critic (no after-states)
-- TD(λ) with eligibility traces
-- Micro-rollout within each turn
 """
 
 from pathlib import Path
-from typing import Union, List, Tuple
+from typing import Optional
 import numpy as np
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 import random
 
 from utils import _flip_board, _flip_move, get_device
 import backgammon
 
-# Set seeds for reproducibility
+# Set seeds
 RANDOM_SEED = 42
 torch.manual_seed(RANDOM_SEED)
 np.random.seed(RANDOM_SEED)
@@ -34,54 +32,74 @@ random.seed(RANDOM_SEED)
 
 class Config:
     """Configuration for micro-move A2C agent."""
-    state_dim = 293  # one-hot encoding dimension
+    # Feature dimension (one-hot encoding)
+    nx = 293  # 24*2*6 + 4 + 1
+    
+    # Micro-action space
     n_micro_actions = 156  # 26 sources × 6 dice
     
+    # Network architecture
+    H = 146  # Hidden layer size (nx // 2, like instructor's)
+    
     # Learning rates
-    lr_critic = 1e-5
-    lr_actor = 1e-5
+    lr_critic = 5e-6   # Very gentle for manual updates
+    lr_actor = 5e-6
     
     # TD(λ) parameters
-    gamma = 1.0  # discount factor (as specified in PDF)
-    lambda_td = 0.9  # eligibility trace decay
+    gamma = 1.0
+    lambda_td = 0.7
     
     # Entropy regularization
-    entropy_coef = 0.01
-    entropy_decay = 0.9999
-    entropy_min = 0.001
-    
-    # Network architecture (ResMLP)
-    model_dim = 512
-    n_blocks = 6
+    entropy_coef = 0.02
+    entropy_decay = 0.99995
+    entropy_min = 0.005
     
     # Gradient clipping
-    max_grad_norm = 0.5
-    
-    # Evaluation
-    eval_temperature = 0.01
-    
-    def __init__(self, **kwargs):
-        for key, value in kwargs.items():
-            if hasattr(self, key):
-                setattr(self, key, value)
+    max_grad_norm = 0.2
 
+CFG = Config()
+
+class Config:
+    """Configuration for micro-move A2C agent."""
+    nx = 293
+    n_micro_actions = 156
+    H = 146
+    
+    # MUCH GENTLER learning rates
+    lr_critic = 1e-6   # 5x smaller
+    lr_actor = 1e-6    # 5x smaller
+    
+    # TD(λ) parameters
+    gamma = 1.0
+    lambda_td = 0.8    # Higher for better credit assignment
+    
+    # Entropy - slower decay
+    entropy_coef = 0.05
+    entropy_decay = 0.999995  # Much slower
+    entropy_min = 0.01
+    
+    # More aggressive clipping
+    max_grad_norm = 0.1
 
 class SmallConfig(Config):
     """Small model for CPU training."""
-    model_dim = 128
-    n_blocks = 3
-
+    H = 64
+    lr_critic = 5e-7   # Even gentler for small model
+    lr_actor = 5e-7
+    lambda_td = 0.75
+    max_grad_norm = 0.08
 
 class MediumConfig(Config):
     """Medium model for modest GPUs."""
-    model_dim = 256
-    n_blocks = 4
+    H = 96
+    lr_critic = 4e-6
+    lr_actor = 4e-6
+    lambda_td = 0.65
 
 
 class LargeConfig(Config):
-    """Large model (default) for full GPU training."""
+    """Large model (default)."""
     pass
-
 
 def get_config(size='large'):
     """Get configuration for specified model size."""
@@ -98,142 +116,79 @@ def get_config(size='large'):
     cfg = configs[size]()
     
     print(f"\nMicro-A2C Configuration: {size.upper()}")
-    print(f"  Architecture: dim={cfg.model_dim}, blocks={cfg.n_blocks}")
+    print(f"  Hidden dim: {cfg.H}")
     print(f"  Learning rates: critic={cfg.lr_critic}, actor={cfg.lr_actor}")
     print(f"  TD(λ): γ={cfg.gamma}, λ={cfg.lambda_td}")
     print(f"  Micro-actions: {cfg.n_micro_actions}")
     
     return cfg
 
+# Set device
+device = get_device()
+print(f"Micro-A2C (simplified) using device: {device}")
 
-CFG = Config()
-CFG.device = get_device()
-print(f"Micro-A2C agent using device: {CFG.device}")
+# ============================================================================
+# Feature encoding (identical to instructor's)
+# ============================================================================
+
+def one_hot_encoding(board, nSecondRoll):
+    """
+    Encode board state as one-hot features.
+    board: array of length 29 from +1 POV
+    nSecondRoll: True if doubles AND first move of turn
+    """
+    oneHot = np.zeros(24 * 2 * 6 + 4 + 1, dtype=np.float32)
+    
+    # +1 side bins: counts 0,1,2,3,4,5+
+    for i in range(0, 5):
+        idx = np.where(board[1:25] == i)[0]
+        if idx.size > 0:
+            oneHot[i * 24 + idx] = 1.0
+    idx = np.where(board[1:25] >= 5)[0]
+    if idx.size > 0:
+        oneHot[5 * 24 + idx] = 1.0
+    
+    # -1 side bins: counts 0,1,2,3,4,5+ (negative)
+    for i in range(0, 5):
+        idx = np.where(board[1:25] == -i)[0]
+        if idx.size > 0:
+            oneHot[6 * 24 + i * 24 + idx] = 1.0
+    idx = np.where(board[1:25] <= -5)[0]
+    if idx.size > 0:
+        oneHot[6 * 24 + 5 * 24 + idx] = 1.0
+    
+    # bars/offs + second-roll flag
+    oneHot[12 * 24 + 0] = board[25]
+    oneHot[12 * 24 + 1] = board[26]
+    oneHot[12 * 24 + 2] = board[27]
+    oneHot[12 * 24 + 3] = board[28]
+    oneHot[12 * 24 + 4] = 1.0 if nSecondRoll else 0.0
+    
+    return oneHot
 
 # ============================================================================
 # Micro-action utilities
 # ============================================================================
-def one_hot_encoding(board29, nSecondRoll: bool):
-    """
-    board29: float/int array length 29 in +1 POV
-    nSecondRoll: True on the first move of doubles, else False
-    returns: np.float32 shape (293,)
-    """
-    oneHot = np.zeros(24 * 2 * 6 + 4 + 1, dtype=np.float32)
-
-    # +1 side bins: counts 0,1,2,3,4,5+
-    for i in range(0, 5):
-        idx = np.where(board29[1:25] == i)[0]         # <-- no -1
-        if idx.size > 0:
-            oneHot[i * 24 + idx] = 1.0
-    idx = np.where(board29[1:25] >= 5)[0]
-    if idx.size > 0:
-        oneHot[5 * 24 + idx] = 1.0
-
-    # -1 side bins: counts 0,1,2,3,4,5+ (negative)
-    for i in range(0, 5):
-        idx = np.where(board29[1:25] == -i)[0]        # <-- no -1
-        if idx.size > 0:
-            oneHot[6 * 24 + i * 24 + idx] = 1.0
-    idx = np.where(board29[1:25] <= -5)[0]
-    if idx.size > 0:
-        oneHot[6 * 24 + 5 * 24 + idx] = 1.0
-
-    # bars/offs + second-roll flag
-    oneHot[12 * 24 + 0] = board29[25]
-    oneHot[12 * 24 + 1] = board29[26]
-    oneHot[12 * 24 + 2] = board29[27]
-    oneHot[12 * 24 + 3] = board29[28]
-    oneHot[12 * 24 + 4] = 1.0 if nSecondRoll else 0.0
-
-    return oneHot
-
-
 
 def encode_micro_action(src: int, die: int) -> int:
-    """
-    Encode (source, die) as action index.
-    Formula: index = 6 * src + (die - 1)
-    
-    Args:
-        src: Source point (0-25, where 0 is no-op/bar indicator)
-        die: Die value (1-6)
-    
-    Returns:
-        Action index in [0, 155]
-    """
-    assert 0 <= src <= 25, f"Invalid source: {src}"
-    assert 1 <= die <= 6, f"Invalid die: {die}"
+    """Encode (source, die) as action index: 6 * src + (die - 1)"""
+    assert 0 <= src <= 25
+    assert 1 <= die <= 6
     return 6 * src + (die - 1)
 
-
-def decode_micro_action(action_idx: int) -> Tuple[int, int]:
-    """
-    Decode action index to (source, die).
-    
-    Args:
-        action_idx: Action index in [0, 155]
-    
-    Returns:
-        (src, die) tuple
-    """
+def decode_micro_action(action_idx: int):
+    """Decode action index to (src, die)"""
     src = action_idx // 6
     die = (action_idx % 6) + 1
     return src, die
 
-
-def build_legality_mask(board29: np.ndarray, die_value: int, player: int = 1) -> np.ndarray:
+def build_legality_mask_multi(board29, dice_remaining, player=1):
     """
-    Build 156-dimensional legality mask for a single die.
-    
-    Args:
-        board29: Board state (length 29) from player's POV
-        die_value: Die value (1-6)
-        player: Player (+1 or -1), but should always be +1 for POV
-    
-    Returns:
-        mask: np.ndarray of shape (156,) with 1.0 for legal, 0.0 for illegal
+    Build 156-dimensional legality mask for remaining dice.
+    Returns mask with 1.0 for legal actions, 0.0 for illegal.
     """
     mask = np.zeros(156, dtype=np.float32)
     
-    # Get legal single-die moves from backgammon.py
-    legal_moves = backgammon.legal_move(board29, die_value, player)
-    
-    if len(legal_moves) == 0:
-        # Only no-op is legal (src=0)
-        mask[encode_micro_action(0, die_value)] = 1.0
-        return mask
-    
-    # Mark each legal move
-    for move in legal_moves:
-        src = int(move[0])
-        action_idx = encode_micro_action(src, die_value)
-        mask[action_idx] = 1.0
-    
-    return mask
-
-
-def build_legality_mask_multi(board29: np.ndarray,
-                              dice_remaining: List[int],
-                              player: int = 1) -> np.ndarray:
-    """
-    Build 156-dimensional legality mask for the current dice multiset D_t.
-
-    Args:
-        board29: Board state (length 29) from player's POV (+1)
-        dice_remaining: list of remaining dice values, e.g. [3, 5] or [4,4,4,4]
-        player: Player (+1 or -1), should be +1 in POV
-
-    Returns:
-        mask: np.ndarray of shape (156,) with 1.0 for legal, 0.0 for illegal
-
-    Semantics:
-      - For each die d in dice_remaining, all legal (src, d) get mask=1.
-      - If *no* legal move exists for *any* die, then for each distinct die
-        we mark the no-op (src=0, that die) as legal.
-    """
-    mask = np.zeros(156, dtype=np.float32)
-
     any_legal = False
     for die in dice_remaining:
         legal_moves = backgammon.legal_move(board29, die, player)
@@ -244,215 +199,138 @@ def build_legality_mask_multi(board29: np.ndarray,
             src = int(move[0])
             action_idx = encode_micro_action(src, die)
             mask[action_idx] = 1.0
-
+    
     if not any_legal:
-        # No legal move for *any* die: only no-ops for each distinct die
+        # No legal moves: only no-ops for each distinct die
         for die in set(dice_remaining):
             mask[encode_micro_action(0, die)] = 1.0
-
+    
     return mask
 
-
 # ============================================================================
-# Network Architecture
+# Network Parameters (Raw Tensors)
 # ============================================================================
 
-class ResMLPBlock(nn.Module):
-    """Residual MLP block with proper normalization."""
-    def __init__(self, dim):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(dim, dim),
-            nn.ReLU(),
-            nn.Linear(dim, dim),
-        )
-        self._init_weights()
-    
-    def _init_weights(self):
-        for m in self.net.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.orthogonal_(m.weight, gain=np.sqrt(2))
-                nn.init.zeros_(m.bias)
-    
-    def forward(self, x):
-        return x + self.net(x)
-
-
-class MicroActorCritic(nn.Module):
+class MicroA2CNetwork:
     """
-    Actor-Critic network for micro-actions.
+    Shallow network with raw tensor parameters (instructor's style).
     
     Architecture:
-    - Shared trunk: state encoder + residual blocks
-    - Actor head: 156 logits (fixed micro-action space)
-    - Critic head: single value output
+      h = tanh(w1 @ x + b1)        # Hidden layer (H,)
+      logits = w2_actor @ h + b2_actor  # Actor head (156,)
+      value = sigmoid(w2_critic @ h + b2_critic)  # Critic head (1,)
     """
     
-    def __init__(self, state_dim=293, model_dim=512, n_blocks=6):
-        super().__init__()
-        self.state_dim = state_dim
-        self.model_dim = model_dim
+    def __init__(self, nx=293, H=146, n_actions=156, device='cpu'):
+        self.nx = nx
+        self.H = H
+        self.n_actions = n_actions
+        self.device = device
         
-        # State encoder
-        self.state_enc = nn.Linear(state_dim, model_dim)
+        # Shared trunk
+        self.w1 = torch.randn(H, nx, device=device, dtype=torch.float32) * 0.05
+        self.b1 = torch.zeros(H, 1, device=device, dtype=torch.float32)
         
-        # Residual MLP blocks (shared trunk)
-        self.blocks = nn.ModuleList([
-            ResMLPBlock(model_dim) for _ in range(n_blocks)
-        ])
+        # Actor head (156 logits)
+        self.w2_actor = torch.randn(n_actions, H, device=device, dtype=torch.float32) * 0.01
+        self.b2_actor = torch.zeros(n_actions, 1, device=device, dtype=torch.float32)
         
-        # Actor head: 156 logits
-        self.actor_head = nn.Linear(model_dim, 156)
+        # Critic head (1 value)
+        self.w2_critic = torch.randn(1, H, device=device, dtype=torch.float32) * 0.1
+        self.b2_critic = torch.zeros(1, 1, device=device, dtype=torch.float32)
         
-        # Critic head: single value
-        self.value_head = nn.Linear(model_dim, 1)
-        
-        self._init_weights()
+        # Mark all as leaf tensors (no autograd by default)
+        for param in [self.w1, self.b1, self.w2_actor, self.b2_actor, 
+                      self.w2_critic, self.b2_critic]:
+            param.requires_grad = False
     
-    def _init_weights(self):
-        nn.init.orthogonal_(self.state_enc.weight, gain=np.sqrt(2))
-        nn.init.zeros_(self.state_enc.bias)
-        nn.init.orthogonal_(self.actor_head.weight, gain=0.01)
-        nn.init.zeros_(self.actor_head.bias)
-        nn.init.orthogonal_(self.value_head.weight, gain=1.0)
-        nn.init.zeros_(self.value_head.bias)
-    
-    def forward(self, state_features, mask):
+    def forward(self, x, mask):
         """
         Forward pass.
         
         Args:
-            state_features: (B, state_dim) - one-hot encoded states
-            mask: (B, 156) - legality mask
+            x: (nx, N) - features for N states
+            mask: (N, 156) - legality mask
         
         Returns:
-            logits: (B, 156) - masked logits
-            values: (B,) - state values
+            logits: (N, 156) - masked logits
+            values: (N,) - value estimates
         """
-        # Encode state
-        x = F.relu(self.state_enc(state_features))
+        N = x.shape[1]  # Number of states in batch
         
-        # Process through residual blocks
-        for block in self.blocks:
-            x = block(x)
+        # Shared hidden layer
+        h = torch.tanh(torch.mm(self.w1, x) + self.b1)  # (H, N)
         
-        # Get logits and values
-        logits = self.actor_head(x)  # (B, 156)
-        values = torch.sigmoid(self.value_head(x)).squeeze(-1)  # bound to [0,1]
+        # Actor logits: (n_actions, H) @ (H, N) = (n_actions, N) -> transpose -> (N, n_actions)
+        logits = torch.mm(self.w2_actor, h).T  # (N, 156)
+        # Broadcast bias: (156, 1) -> (156,)
+        logits = logits + self.b2_actor.squeeze()  # (N, 156)
         
-        # Apply mask (use -1e9 instead of -inf for MPS compatibility)
+        # Critic value: (1, H) @ (H, N) = (1, N) -> squeeze -> (N,)
+        values = torch.mm(self.w2_critic, h).squeeze(0)  # (N,)
+        # Add bias scalar
+        values = values + self.b2_critic.squeeze()  # (N,)
+        
+        # Apply mask
         logits = logits.masked_fill(mask == 0, -1e9)
         
         return logits, values
     
-    def get_value(self, state_features):
-        """Get value estimate only (for critic-only forward pass)."""
-        x = F.relu(self.state_enc(state_features))
-        for block in self.blocks:
-            x = block(x)
-        values = torch.sigmoid(self.value_head(x)).squeeze(-1)  # bound to [0,1]
-        return values
-
+    def parameters(self):
+        """Return list of all parameters."""
+        return [self.w1, self.b1, self.w2_actor, self.b2_actor, 
+                self.w2_critic, self.b2_critic]
 
 # ============================================================================
 # Eligibility Traces
 # ============================================================================
 
-class TDLambdaTraces:
-    """
-    Eligibility traces for TD(λ) learning.
+class EligibilityTraces:
+    """TD(λ) eligibility traces for manual parameter updates."""
     
-    Maintains separate traces for actor and critic parameters.
-    """
-    
-    def __init__(self, acnet, lambda_val=0.9):
+    def __init__(self, network, lambda_val=0.7):
+        self.network = network
         self.lambda_val = lambda_val
-        self.acnet = acnet
-        self.critic_traces = {}
-        self.actor_traces = {}
-        self._initialize_traces()
-    
-    def _initialize_traces(self):
-        """Initialize trace tensors (zeros)."""
-        for name, param in self.acnet.named_parameters():
-            self.critic_traces[name] = torch.zeros_like(param.data)
-            self.actor_traces[name] = torch.zeros_like(param.data)
+        
+        # Initialize traces for each parameter
+        self.critic_traces = [torch.zeros_like(p) for p in network.parameters()]
+        self.actor_traces = [torch.zeros_like(p) for p in network.parameters()]
     
     def reset(self):
-        """Reset all traces to zero (call at episode start)."""
-        for name in self.critic_traces:
-            self.critic_traces[name].zero_()
-        for name in self.actor_traces:
-            self.actor_traces[name].zero_()
+        """Reset all traces to zero."""
+        for trace in self.critic_traces:
+            trace.zero_()
+        for trace in self.actor_traces:
+            trace.zero_()
     
-    def update_critic(self, td_error: float, alpha_critic: float):
-        """
-        Update critic traces and apply TD error.
-        
-        Formula: e_V = λ * e_V + ∇V(s)
-                 φ ← φ + α_c * δ * e_V
-        
-        Args:
-            td_error: TD error δ
-            alpha_critic: Critic learning rate
-        """
-        for name, param in self.acnet.named_parameters():
-            if ('value_head' in name or 'state_enc' in name or 'blocks' in name) and param.grad is not None:
-                # Update trace: e = λ * e + ∇V
-                self.critic_traces[name].mul_(self.lambda_val).add_(param.grad.data)
-                
-                # Apply: φ ← φ + α * δ * e
-                param.data.add_(self.critic_traces[name], alpha=alpha_critic * td_error)
-    
-    def update_actor(self, td_error: float, alpha_actor: float):
-        """
-        Update actor traces and apply TD error.
-        
-        Formula: e_π = λ * e_π + ∇log π(a|s)
-                 θ ← θ + α_a * δ * e_π
-        
-        Args:
-            td_error: TD error δ
-            alpha_actor: Actor learning rate
-        """
-        for name, param in self.acnet.named_parameters():
-            if ('actor_head' in name or 'state_enc' in name or 'blocks' in name) and param.grad is not None:
-                # Update trace: e = λ * e + ∇log π
-                self.actor_traces[name].mul_(self.lambda_val).add_(param.grad.data)
-                
-                # Apply: θ ← θ + α * δ * e
-                param.data.add_(self.actor_traces[name], alpha=alpha_actor * td_error)
-
+    def decay(self):
+        """Decay all traces by λ."""
+        for trace in self.critic_traces:
+            trace.mul_(self.lambda_val)
+        for trace in self.actor_traces:
+            trace.mul_(self.lambda_val)
 
 # ============================================================================
 # Micro-move A2C Agent
 # ============================================================================
 
 class MicroA2CAgent:
-    """
-    Micro-move Actor-Critic agent for Backgammon.
-    
-    Implements the specification from Part B of the assignment PDF.
-    """
+    """Simplified Micro-A2C agent with manual TD(λ) updates."""
     
     def __init__(self, config=None, device=None):
         self.config = config or CFG
         self.device = device or get_device()
         
         # Network
-        self.acnet = MicroActorCritic(
-            state_dim=self.config.state_dim,
-            model_dim=self.config.model_dim,
-            n_blocks=self.config.n_blocks
-        ).to(self.device)
+        self.net = MicroA2CNetwork(
+            nx=self.config.nx,
+            H=self.config.H,
+            n_actions=self.config.n_micro_actions,
+            device=self.device
+        )
         
         # Eligibility traces
-        self.traces = TDLambdaTraces(self.acnet, lambda_val=self.config.lambda_td)
-
-        # Expose trace dictionaries for direct access
-        self.critic_traces = self.traces.critic_traces
-        self.actor_traces = self.traces.actor_traces
-        self.lambda_val = self.traces.lambda_val 
+        self.traces = EligibilityTraces(self.net, lambda_val=self.config.lambda_td)
         
         # Training state
         self.steps = 0
@@ -460,7 +338,7 @@ class MicroA2CAgent:
         self.eval_mode = False
         self.current_entropy_coef = self.config.entropy_coef
         
-        # Stats tracking
+        # Stats
         self.stats = {
             'td_errors': [],
             'values': [],
@@ -468,47 +346,26 @@ class MicroA2CAgent:
             'rewards': [],
         }
         
-        print(f"MicroA2CAgent initialized:")
+        print(f"MicroA2CAgent (simplified) initialized:")
         print(f"  Device: {self.device}")
-        print(f"  Learning rates: critic={self.config.lr_critic}, actor={self.config.lr_actor}")
-        print(f"  TD(λ): γ={self.config.gamma}, λ={self.config.lambda_td}")
-        print(f"  Parameters: {sum(p.numel() for p in self.acnet.parameters()):,}")
+        print(f"  Hidden dim: {self.config.H}")
+        print(f"  Learning rates: {self.config.lr_critic}, {self.config.lr_actor}")
     
-    def _encode_state(self, board29, is_second_roll: bool) -> np.ndarray:
-        """
-        Encode board state as one-hot features.
-        
-        Args:
-            board29: Board state (length 29)
-            is_second_roll: True only if doubles AND first micro-step of turn
-        
-        Returns:
-            features: np.ndarray of shape (293,)
-        """
+    def _encode_state(self, board29, is_second_roll: bool):
+        """Encode board state as one-hot features."""
         return one_hot_encoding(board29.astype(np.float32), is_second_roll)
     
+    @torch.no_grad()
     def select_micro_action(self, state_features, mask, training=True):
-        """
-        Select a micro-action given state and legality mask.
-        
-        Args:
-            state_features: np.ndarray of shape (293,)
-            mask: np.ndarray of shape (156,) - legality mask
-            training: If True, sample stochastically; else greedy
-        
-        Returns:
-            action_idx: Selected action index
-            log_prob: Log probability of selected action
-            value: State value estimate
-        """
+        """Select a micro-action given state and legality mask."""
         # Convert to tensors
-        state_t = torch.tensor(state_features, dtype=torch.float32, device=self.device).unsqueeze(0)
+        x = torch.tensor(state_features, dtype=torch.float32, device=self.device).view(self.config.nx, 1)
         mask_t = torch.tensor(mask, dtype=torch.float32, device=self.device).unsqueeze(0)
         
-        with torch.no_grad():
-            logits, value = self.acnet(state_t, mask_t)
-            logits = logits.squeeze(0)  # (156,)
-            value = value.item()
+        # Forward pass
+        logits, value = self.net.forward(x, mask_t)
+        logits = logits.squeeze(0)  # (156,)
+        value = value.item()
         
         # Action selection
         if training and not self.eval_mode:
@@ -517,7 +374,6 @@ class MicroA2CAgent:
             
             # Safety check
             if torch.isnan(probs).any() or torch.isinf(probs).any():
-                print(f"[WARNING] Invalid probabilities. Using uniform over legal actions.")
                 probs = torch.tensor(mask, device=self.device)
                 probs = probs / probs.sum()
             
@@ -529,57 +385,33 @@ class MicroA2CAgent:
             log_prob = 0.0
         
         return action_idx, log_prob, value
-
+    
     def _apply_micro_action(self, board29, action_idx):
-        """
-        Apply a single micro-action (src, die) to the board.
-
-        Args:
-            board29: Current board state
-            action_idx: Micro-action index (encodes both src and die)
-
-        Returns:
-            next_board: Board after applying action
-            is_noop: True if action was no-op (src=0)
-        """
+        """Apply a single micro-action to the board."""
         src, die_value = decode_micro_action(action_idx)
-
+        
         if src == 0:
-            # No-op: die is effectively dead, board unchanged
+            # No-op
             return board29.copy(), True
-
-        # Get legal moves for this die to find destination
+        
+        # Get legal moves for this die
         legal_moves = backgammon.legal_move(board29, die_value, player=1)
-
+        
         move = None
         for m in legal_moves:
             if int(m[0]) == src:
                 move = m
                 break
-
+        
         if move is None:
-            # Should not happen if mask is correct
-            print(f"[WARNING] No legal move found for src={src}, die={die_value}")
             return board29.copy(), True
-
+        
         # Apply the move
         next_board = backgammon.update_board(board29, move.reshape(1, 2), player=1)
         return next_board, False
     
     def micro_rollout_turn(self, board29, dice, training=True):
-        """
-        Execute a complete turn as a sequence of micro-steps.
-
-        Args:
-            board29: Initial board state from +1 POV
-            dice: Dice roll (length 2)
-            training: If True, collect trajectory for learning
-
-        Returns:
-            trajectory: List of micro-step transitions
-            final_board: Board state after turn
-            full_move: Complete move sequence (for compatibility)
-        """
+        """Execute a complete turn as a sequence of micro-steps."""
         # Doubles: four dice; otherwise: two dice
         if dice[0] == dice[1]:
             dice_remaining = [dice[0]] * 4
@@ -587,58 +419,55 @@ class MicroA2CAgent:
         else:
             dice_remaining = [dice[0], dice[1]]
             is_doubles = False
-
+        
         trajectory = []
         current_board = board29.copy()
-        move_sequence = []  # Track actual moves (src,dst) for reconstruction
-        micro_step = 0      # Micro-step index within this turn
-
+        move_sequence = []
+        micro_step = 0
+        
         while dice_remaining:
-            # Build legality mask over ALL remaining dice
+            # Build legality mask
             mask = build_legality_mask_multi(current_board, dice_remaining, player=1)
-
-            # Encode state with correct second-roll flag:
-            # True only for doubles AND first micro-step
+            
+            # Encode state (second-roll flag only for doubles AND first step)
             is_second_roll = is_doubles and (micro_step == 0)
             state_features = self._encode_state(current_board, is_second_roll)
-
-            # Select action (src, die) from masked policy over all dice
+            
+            # Select action
             action_idx, log_prob, value = self.select_micro_action(
                 state_features, mask, training=training
             )
-
-            # Decode to know which die was actually used
+            
+            # Decode action
             src, die_value = decode_micro_action(action_idx)
-
+            
             # Apply micro-action
             next_board, is_noop = self._apply_micro_action(current_board, action_idx)
-
-            # Record actual (src,dst) move if not no-op
+            
+            # Record move if not no-op
             if not is_noop:
                 legal = backgammon.legal_move(current_board, die_value, player=1)
                 for m in legal:
                     if int(m[0]) == src:
                         move_sequence.append(np.array([m[0], m[1]], dtype=np.int32))
                         break
-
-            # Remove ONE occurrence of that die from remaining dice
+            
+            # Remove die
             try:
                 die_idx = dice_remaining.index(die_value)
                 dice_remaining.pop(die_idx)
             except ValueError:
-                # Should not happen if mask and decode are consistent
-                print(f"[WARNING] Die {die_value} not in dice_remaining={dice_remaining}")
-                dice_remaining.pop(0)  # fallback: drop first
+                dice_remaining.pop(0)
+            
             micro_step += 1
-
-            # Compute reward / terminal transition at every micro-step
+            
+            # Check if game is over
             done = backgammon.game_over(next_board)
             reward = 0.0
             if done:
-                # +1 for win, -1 for loss (from +1 POV)
                 reward = 1.0 if next_board[27] == 15 else -1.0
-
-            # Store transition (including noop steps!)
+            
+            # Store transition
             if training:
                 trajectory.append({
                     'state': state_features,
@@ -648,33 +477,31 @@ class MicroA2CAgent:
                     'value': value,
                     'reward': reward,
                     'done': done,
-                    'board': current_board.copy(),
                 })
-
+            
             current_board = next_board
-
-            # Break early if game is over
+            
             if done:
                 break
-
-        # Reconstruct full move - ensure compatible format with backgammon.py
+        
+        # Reconstruct full move
         if len(move_sequence) == 0:
             full_move = np.empty((0, 2), dtype=np.int32)
         elif len(move_sequence) == 1:
             full_move = move_sequence[0].reshape(1, 2)
         else:
-            # At most 4 moves per doubles turn, but train.py expects <=2 per call.
-            # Keep first two moves for compatibility.
             full_move = np.vstack(move_sequence[:2]).reshape(-1, 2)
-
+        
         return trajectory, current_board, full_move
     
     def td_lambda_update(self, trajectory):
         """
-        Perform TD(λ) updates for a micro-rollout trajectory.
+        Perform TD(λ) updates with manual parameter updates.
         
-        Args:
-            trajectory: List of micro-step transitions
+        Follows instructor's style:
+        1. Compute gradients manually
+        2. Update eligibility traces
+        3. Apply parameter updates: param += lr * δ * trace
         """
         if len(trajectory) == 0:
             return
@@ -686,27 +513,32 @@ class MicroA2CAgent:
             mask = transition['mask']
             reward = transition['reward']
             done = transition['done']
-            #value = transition['value']
-
+            
             # Convert to tensors
-            state_t = torch.tensor(state, dtype=torch.float32, device=self.device).unsqueeze(0)
+            x = torch.tensor(state, dtype=torch.float32, device=self.device).view(self.config.nx, 1)
             mask_t = torch.tensor(mask, dtype=torch.float32, device=self.device).unsqueeze(0)
             
+            # Enable gradients temporarily
+            for param in self.net.parameters():
+                param.requires_grad = True
+            
             # ============================================================
-            # STEP 1: Compute V(sₜ) with gradients for trace update
+            # STEP 1: Compute V(sₜ) and its gradient
             # ============================================================
-            self.acnet.zero_grad()
-            _, value_t = self.acnet(state_t, mask_t)
+            _, value_t = self.net.forward(x, mask_t)
             value_current = value_t.item()
             
-            # Compute gradient ∇φVφ(sₜ) for critic trace
+            # Compute ∇V for critic trace
             value_t.backward()
             
-            # Update CRITIC trace: eᵛₜ = λ eᵛₜ₋₁ + ∇φVφ(sₜ)
-            for name, param in self.acnet.named_parameters():
-                # Only update critic parameters (value_head, and shared trunk)
-                if param.grad is not None and ('value_head' in name or 'state_enc' in name or 'blocks' in name):
-                    self.critic_traces[name].mul_(self.lambda_val).add_(param.grad.data)
+            # Store critic gradients
+            critic_grads = [p.grad.clone() if p.grad is not None else torch.zeros_like(p) 
+                           for p in self.net.parameters()]
+            
+            # Clear gradients
+            for param in self.net.parameters():
+                if param.grad is not None:
+                    param.grad.zero_()
             
             # ============================================================
             # STEP 2: Compute V(sₜ₊₁) for TD error
@@ -716,64 +548,87 @@ class MicroA2CAgent:
             else:
                 next_state = trajectory[t + 1]['state']
                 next_mask = trajectory[t + 1]['mask']
-                next_state_t = torch.tensor(next_state, dtype=torch.float32, device=self.device).unsqueeze(0)
+                next_x = torch.tensor(next_state, dtype=torch.float32, device=self.device).view(self.config.nx, 1)
                 next_mask_t = torch.tensor(next_mask, dtype=torch.float32, device=self.device).unsqueeze(0)
                 
                 with torch.no_grad():
-                    _, next_value_t = self.acnet(next_state_t, next_mask_t)
+                    for param in self.net.parameters():
+                        param.requires_grad = False
+                    _, next_value_t = self.net.forward(next_x, next_mask_t)
                     next_value = next_value_t.item()
             
-            # TD error: δ = r + γV(s') - V(s)
+            # TD error
             td_error = reward + (0.0 if done else self.config.gamma * next_value) - value_current
             
-            # ============================================================
-            # STEP 3: Apply critic update: φ ← φ + αc δₜ eᵛₜ
-            # ============================================================
-            for name, param in self.acnet.named_parameters():
-                if 'value_head' in name or 'state_enc' in name or 'blocks' in name:
-                    param.data.add_(self.critic_traces[name], alpha=self.config.lr_critic * td_error)
+            # CRITICAL: Clip TD error to prevent divergence
+            td_error = np.clip(td_error, -1.0, 1.0)
             
             # ============================================================
-            # STEP 4: Compute ∇Θ log πΘ(aₜ | sₜ) for actor trace
+            # STEP 3: Update critic traces and parameters
             # ============================================================
+            # Only update: w1, b1 (shared), w2_critic, b2_critic
+            param_list = [self.net.w1, self.net.b1, self.net.w2_critic, self.net.b2_critic]
+            grad_indices = [0, 1, 4, 5]  # Indices in parameters() list
             
-            # Forward pass (with gradients)
-            self.acnet.zero_grad()
-            logits, _ = self.acnet(state_t, mask_t)
+            for param_idx, param in zip(grad_indices, param_list):
+                grad = critic_grads[param_idx]
+                
+                # Update trace: e = λ * e + ∇V
+                self.traces.critic_traces[param_idx].mul_(self.config.lambda_td).add_(grad)
+                
+                # Clip trace
+                trace_norm = self.traces.critic_traces[param_idx].norm().item()
+                if trace_norm > self.config.max_grad_norm:
+                    self.traces.critic_traces[param_idx].mul_(self.config.max_grad_norm / trace_norm)
+                
+                # Apply update: param += α * δ * trace
+                param.data.add_(self.traces.critic_traces[param_idx], alpha=self.config.lr_critic * td_error)
+            
+            # ============================================================
+            # STEP 4: Compute ∇log π(aₜ|sₜ) for actor trace
+            # ============================================================
+            for param in self.net.parameters():
+                param.requires_grad = True
+            
+            logits, _ = self.net.forward(x, mask_t)
             log_probs = F.log_softmax(logits.masked_fill(mask_t == 0, -1e9), dim=-1)
             log_prob = log_probs[0, action]
             
-            # Add entropy bonus
-            probs = F.softmax(logits, dim=-1)
+            # Entropy bonus
+            probs = F.softmax(logits.masked_fill(mask_t == 0, -1e9), dim=-1)
             entropy = -(probs * log_probs).sum()
             
-            # Actor objective (negative for gradient ascent)
+            # Actor objective
             actor_obj = log_prob + self.current_entropy_coef * entropy
             actor_obj.backward()
-
-            # Update ACTOR trace: eᵖₜ = λ eᵖₜ₋₁ + ∇Θ log πΘ(aₜ | sₜ)
-            for name, param in self.acnet.named_parameters():
-                # Only update actor parameters (actor_head, and shared trunk)
-                if param.grad is not None and ('actor_head' in name or 'state_enc' in name or 'blocks' in name):
-                    self.actor_traces[name].mul_(self.lambda_val).add_(param.grad.data)
-
-            # Gradient clipping on traces (optional but recommended)
-            total_norm = 0.0
-            for trace in self.actor_traces.values():
-                total_norm += trace.norm().item() ** 2
-            total_norm = np.sqrt(total_norm)
             
-            if total_norm > self.config.max_grad_norm:
-                clip_coef = self.config.max_grad_norm / (total_norm + 1e-6)
-                for trace in self.actor_traces.values():
-                    trace.mul_(clip_coef)
-
+            # Store actor gradients
+            actor_grads = [p.grad.clone() if p.grad is not None else torch.zeros_like(p) 
+                          for p in self.net.parameters()]
+            
+            # Clear gradients
+            for param in self.net.parameters():
+                if param.grad is not None:
+                    param.grad.zero_()
+            
             # ============================================================
-            # STEP 5: Apply actor update: Θ ← Θ + αa δₜ eᵖₜ
+            # STEP 5: Update actor traces and parameters
             # ============================================================
-            for name, param in self.acnet.named_parameters():
-                if 'actor_head' in name or 'state_enc' in name or 'blocks' in name:
-                    param.data.add_(self.actor_traces[name], alpha=self.config.lr_actor * td_error)
+            for i, (param, grad) in enumerate(zip(self.net.parameters(), actor_grads)):
+                # Update trace: e = λ * e + ∇log π
+                self.traces.actor_traces[i].mul_(self.config.lambda_td).add_(grad)
+                
+                # Clip trace
+                trace_norm = self.traces.actor_traces[i].norm().item()
+                if trace_norm > self.config.max_grad_norm:
+                    self.traces.actor_traces[i].mul_(self.config.max_grad_norm / trace_norm)
+                
+                # Apply update: param += α * δ * trace
+                param.data.add_(self.traces.actor_traces[i], alpha=self.config.lr_actor * td_error)
+            
+            # Disable gradients after update
+            for param in self.net.parameters():
+                param.requires_grad = False
             
             # Track stats
             self.stats['td_errors'].append(td_error)
@@ -784,46 +639,41 @@ class MicroA2CAgent:
             self.steps += 1
         
         self.updates += 1
-
-        # Decay entropy coefficient
+        
+        # Decay entropy
         self.current_entropy_coef = max(
-        self.config.entropy_min,
-        self.current_entropy_coef * self.config.entropy_decay
-    )
-        # Print stats periodically
+            self.config.entropy_min,
+            self.current_entropy_coef * self.config.entropy_decay
+        )
+        
+        # Print stats
         if self.updates % 100 == 0:
-            recent_td = np.mean(self.stats['td_errors'][-100:])
-            recent_v = np.mean(self.stats['values'][-100:])
-            recent_ent = np.mean(self.stats['entropy'][-100:])
+            recent_td = np.mean(self.stats['td_errors'][-100:]) if self.stats['td_errors'] else 0.0
+            recent_v = np.mean(self.stats['values'][-100:]) if self.stats['values'] else 0.0
+            recent_ent = np.mean(self.stats['entropy'][-100:]) if self.stats['entropy'] else 0.0
+            recent_rewards = np.mean(self.stats['rewards'][-100:]) if self.stats['rewards'] else 0.0
+            
+            # Check trace norms
+            critic_trace_norm = sum(t.norm().item() for t in self.traces.critic_traces) / len(self.traces.critic_traces)
+            actor_trace_norm = sum(t.norm().item() for t in self.traces.actor_traces) / len(self.traces.actor_traces)
+            
             print(f"\n[Micro-A2C Update #{self.updates}]")
             print(f"  Avg TD error: {recent_td:.4f}")
             print(f"  Avg value: {recent_v:.4f}")
             print(f"  Avg entropy: {recent_ent:.4f}")
-            print(f"  Entropy coef: {self.current_entropy_coef:.6f}")
+            print(f"  Avg reward: {recent_rewards:.4f}")
+            print(f"  Critic trace norm: {critic_trace_norm:.4f}")
+            print(f"  Actor trace norm: {actor_trace_norm:.4f}")
             print(f"  Total steps: {self.steps:,}")
     
     def action(self, board_copy, dice, player, i, train=False, train_config=None):
-        """
-        Select action for a turn (compatible with training loop API).
-        
-        Args:
-            board_copy: Board state
-            dice: Dice roll
-            player: Player (+1 or -1)
-            i: Move index within turn (not used in micro-approach)
-            train: If True, perform learning updates
-            train_config: Training configuration (not used)
-        
-        Returns:
-            move: Move array compatible with backgammon.py
-        """
+        """Select action for a turn (API compatibility)."""
         # Flip to +1 POV
         board_pov = _flip_board(board_copy) if player == -1 else board_copy.copy()
         
-        # Check for legal moves using standard backgammon.legal_moves
+        # Check for legal moves
         possible_moves, _ = backgammon.legal_moves(board_pov, dice, player=1)
         if len(possible_moves) == 0:
-            # No legal moves - return empty move
             return np.array([], dtype=np.int32).reshape(0, 2)
         
         # Execute micro-rollout
@@ -835,18 +685,11 @@ class MicroA2CAgent:
         if train and not self.eval_mode:
             self.td_lambda_update(trajectory)
         
-        # Ensure move has correct shape
+        # Ensure correct shape
         if full_move.size == 0:
-            # Empty move case
             full_move = np.array([], dtype=np.int32).reshape(0, 2)
-        elif full_move.ndim == 1:
-            # Single move stored as 1D - reshape to (1, 2)
-            if len(full_move) == 2:
-                full_move = full_move.reshape(1, 2)
-            else:
-                # Malformed move, return empty
-                full_move = np.array([], dtype=np.int32).reshape(0, 2)
-        # else: full_move already has shape (k, 2)
+        elif full_move.ndim == 1 and len(full_move) == 2:
+            full_move = full_move.reshape(1, 2)
         
         # Flip move back if needed
         if player == -1 and full_move.size > 0:
@@ -855,7 +698,7 @@ class MicroA2CAgent:
         return full_move
     
     def episode_start(self):
-        """Called at episode start - reset eligibility traces."""
+        """Called at episode start."""
         self.traces.reset()
     
     def end_episode(self, outcome, final_board, perspective):
@@ -865,66 +708,47 @@ class MicroA2CAgent:
     def set_eval_mode(self, is_eval: bool):
         """Set evaluation mode."""
         self.eval_mode = is_eval
-        if is_eval:
-            self.acnet.eval()
-        else:
-            self.acnet.train()
     
     def save(self, path: str):
         """Save agent checkpoint."""
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         torch.save({
-            'acnet': self.acnet.state_dict(),
+            'w1': self.net.w1,
+            'b1': self.net.b1,
+            'w2_actor': self.net.w2_actor,
+            'b2_actor': self.net.b2_actor,
+            'w2_critic': self.net.w2_critic,
+            'b2_critic': self.net.b2_critic,
             'steps': self.steps,
             'updates': self.updates,
             'entropy_coef': self.current_entropy_coef,
-            'config': {
-                'state_dim': self.config.state_dim,
-                'model_dim': self.config.model_dim,
-                'n_blocks': self.config.n_blocks,
-                'lr_critic': self.config.lr_critic,
-                'lr_actor': self.config.lr_actor,
-                'lambda_td': self.config.lambda_td,
-            }
         }, path)
         print(f"Saved checkpoint: {path}")
     
-    def load(self, path: str, map_location: Union[str, torch.device] = None, load_optimizer: bool = True):
+    def load(self, path: str, map_location=None, load_optimizer: bool = True):
         """Load agent checkpoint."""
         if map_location is None:
             map_location = self.device
         
         checkpoint = torch.load(path, map_location=map_location)
         
-        # Check if architecture matches
-        saved_config = checkpoint.get('config', {})
-        if saved_config:
-            if (saved_config.get('state_dim', self.config.state_dim) != self.config.state_dim or
-                saved_config.get('model_dim', self.config.model_dim) != self.config.model_dim or
-                saved_config.get('n_blocks', self.config.n_blocks) != self.config.n_blocks):
-                
-                print(f"  Rebuilding network with saved architecture")
-                self.acnet = MicroActorCritic(
-                    state_dim=saved_config.get('state_dim', self.config.state_dim),
-                    model_dim=saved_config.get('model_dim', self.config.model_dim),
-                    n_blocks=saved_config.get('n_blocks', self.config.n_blocks)
-                ).to(self.device)
-                
-                # Reinitialize traces
-                self.traces = TDLambdaTraces(self.acnet, lambda_val=self.config.lambda_td)
+        self.net.w1.copy_(checkpoint['w1'])
+        self.net.b1.copy_(checkpoint['b1'])
+        self.net.w2_actor.copy_(checkpoint['w2_actor'])
+        self.net.b2_actor.copy_(checkpoint['b2_actor'])
+        self.net.w2_critic.copy_(checkpoint['w2_critic'])
+        self.net.b2_critic.copy_(checkpoint['b2_critic'])
         
-        self.acnet.load_state_dict(checkpoint['acnet'])
         self.steps = checkpoint.get('steps', 0)
         self.updates = checkpoint.get('updates', 0)
         self.current_entropy_coef = checkpoint.get('entropy_coef', self.config.entropy_coef)
         
         print(f"Loaded checkpoint: {path}")
-        print(f"  Steps: {self.steps:,}")
-        print(f"  Updates: {self.updates:,}")
+        print(f"  Steps: {self.steps:,}, Updates: {self.updates:,}")
 
 
 # ============================================================================
-# Module-level interface (for compatibility)
+# Module-level interface
 # ============================================================================
 
 _default_agent = None
@@ -933,12 +757,9 @@ CHECKPOINT_PATH = Path("checkpoints/best_micro_a2c.pt")
 
 
 def _get_agent():
-    """Get or create the default agent instance."""
     global _default_agent
     if _default_agent is None:
-        device = get_device()
         _default_agent = MicroA2CAgent(config=CFG, device=device)
-        print(f"Micro-A2C agent initialized")
     return _default_agent
 
 
@@ -946,14 +767,13 @@ def save(path: str = str(CHECKPOINT_PATH)):
     _get_agent().save(path)
 
 
-def load(path: str = str(CHECKPOINT_PATH), map_location: Union[str, torch.device] = None):
+def load(path: str = str(CHECKPOINT_PATH), map_location=None):
     global _loaded_from_disk
     agent = _get_agent()
     if map_location is None:
         map_location = agent.device
     agent.load(path, map_location)
     _loaded_from_disk = True
-    print(f"[Module] Agent loaded from {path}")
 
 
 def set_eval_mode(is_eval: bool):
@@ -965,10 +785,9 @@ def action(board_copy, dice, player, i, train=False, train_config=None):
     if not train and not _loaded_from_disk:
         if CHECKPOINT_PATH.exists():
             try:
-                print(f"[Module] Auto-loading checkpoint: {CHECKPOINT_PATH}")
                 load(str(CHECKPOINT_PATH), map_location=_get_agent().device)
             except Exception as e:
-                print(f"[Module] Could not load checkpoint: {e}")
+                print(f"Could not load checkpoint: {e}")
             _loaded_from_disk = True
     return _get_agent().action(board_copy, dice, player, i, train, train_config)
 
@@ -979,53 +798,3 @@ def episode_start():
 
 def end_episode(outcome, final_board, perspective):
     _get_agent().end_episode(outcome, final_board, perspective)
-
-
-def __getattr__(name):
-    if name in ['steps', 'updates', 'eval_mode', 'current_entropy_coef', 'stats', 'CFG']:
-        if name == 'CFG':
-            return CFG
-        agent = _get_agent()
-        return getattr(agent, name)
-    raise AttributeError(f"module '{__name__}' has no attribute '{name}'")
-
-
-if __name__ == "__main__":
-    # Quick test
-    print("\n" + "="*70)
-    print("MICRO-A2C AGENT TEST")
-    print("="*70)
-    
-    # Create agent
-    agent = MicroA2CAgent(config=get_config('small'), device='cpu')
-    
-    # Test action encoding/decoding
-    print("\nTesting action encoding:")
-    for src in [0, 1, 6, 24, 25]:
-        for die in [1, 6]:
-            idx = encode_micro_action(src, die)
-            src_dec, die_dec = decode_micro_action(idx)
-            print(f"  src={src:2d}, die={die} → idx={idx:3d} → src={src_dec:2d}, die={die_dec}")
-            assert src == src_dec and die == die_dec
-    
-    # Test legality mask
-    print("\nTesting legality mask:")
-    board = backgammon.init_board()
-    dice_roll = backgammon.roll_dice()
-    print(f"  Dice: {dice_roll}")
-    for die in dice_roll:
-        mask = build_legality_mask(board, die, player=1)
-        n_legal = int(mask.sum())
-        print(f"  Die {die}: {n_legal} legal actions")
-    
-    # Test action selection
-    print("\nTesting action selection:")
-    trajectory, final_board, move = agent.micro_rollout_turn(board, dice_roll, training=False)
-    print(f"  Trajectory length: {len(trajectory)}")
-    print(f"  Final move: {move}")
-    
-    print("\n" + "="*70)
-    print("TEST COMPLETE")
-    print("="*70)
-
-

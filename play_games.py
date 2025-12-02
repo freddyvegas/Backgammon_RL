@@ -365,8 +365,14 @@ def play_games_batched_transformer(agent_obj, opponent, batch_size=8, training=T
     D    = agent_obj.config.state_dim
     Amax = agent_obj.config.max_actions
 
-    # Get device from agent
+    # Get device & data-efficiency knobs from agent
     device = agent_obj.device if hasattr(agent_obj, "device") else agent_obj.config.device
+    history_cap = (
+        agent_obj.config.max_seq_len
+        if getattr(agent_obj.config, "limit_history_to_max_seq", True)
+        else None
+    )
+    vectorize_candidates = getattr(agent_obj.config, "vectorize_candidate_encoding", True)
 
     # ---- Initialize games and seed history with initial token ----
     for i in range(batch_size):
@@ -381,7 +387,10 @@ def play_games_batched_transformer(agent_obj, opponent, batch_size=8, training=T
 
         board_pov = flip_to_pov_plus1(board, 1)         # np.array(29,)
         # NEW: append torch-encoded token
-        append_token_torch(histories293, hist_lens, i, board_pov, (passes_left[i] > 1), device=device)
+        append_token_torch(
+            histories293, hist_lens, i, board_pov, (passes_left[i] > 1),
+            device=device, max_seq_len=history_cap
+        )
 
     # ---- Main loop ----
     while any(env_active):
@@ -421,7 +430,7 @@ def play_games_batched_transformer(agent_obj, opponent, batch_size=8, training=T
                 # Make sure the current observation token is at the history tail
                 append_token_torch(
                     histories293, hist_lens, idx,
-                    board_pov, (moves_left > 1), device=device
+                    board_pov, (moves_left > 1), device=device, max_seq_len=history_cap
                 )
 
                 # Build candidates (Amax, D) as torch
@@ -429,13 +438,21 @@ def play_games_batched_transformer(agent_obj, opponent, batch_size=8, training=T
                 mask_t       = torch.zeros(Amax, dtype=torch.float32, device=device)
 
                 nA = min(len(pboards), Amax)
-                for a in range(nA):
-                    after29 = flip_to_pov_plus1(pboards[a], 1).astype(np.float32)  # np(29,)
-                    # Next-step roll flag (approximate): after playing this partial move
+                if nA > 0:
                     nSecondRoll_next = ((passes_left[idx] - 1) > 1)
-                    after29_t = torch.from_numpy(after29).to(device=device)
-                    cand_feats_t[a] = one_hot_encoding_torch(after29_t, nSecondRoll_next)
-                    mask_t[a] = 1.0
+                    if vectorize_candidates:
+                        after_stack = np.stack(
+                            [flip_to_pov_plus1(pboards[a], 1).astype(np.float32) for a in range(nA)],
+                            axis=0
+                        )
+                        after29_t = torch.from_numpy(after_stack).to(device=device)
+                        cand_feats_t[:nA] = one_hot_encoding_torch(after29_t, nSecondRoll_next)
+                    else:
+                        for a in range(nA):
+                            after29 = flip_to_pov_plus1(pboards[a], 1).astype(np.float32)
+                            after29_t = torch.from_numpy(after29).to(device=device)
+                            cand_feats_t[a] = one_hot_encoding_torch(after29_t, nSecondRoll_next)
+                    mask_t[:nA] = 1.0
 
                 # Current state feature as torch (D,)
                 board_pov_t = torch.from_numpy(board_pov).to(device=device)
@@ -501,7 +518,8 @@ def play_games_batched_transformer(agent_obj, opponent, batch_size=8, training=T
                 # Append the post-action observation token (torch)
                 append_token_torch(
                     histories293, hist_lens, idx,
-                    flip_to_pov_plus1(boards[idx], 1), False, device=device
+                    flip_to_pov_plus1(boards[idx], 1), False,
+                    device=device, max_seq_len=history_cap
                 )
 
                 # Push transformer tuple to per-env rollout (training only)
@@ -559,7 +577,8 @@ def play_games_batched_transformer(agent_obj, opponent, batch_size=8, training=T
             # Append post-opponent token (torch)
             append_token_torch(
                 histories293, hist_lens, idx,
-                flip_to_pov_plus1(boards[idx], 1), False, device=device
+                flip_to_pov_plus1(boards[idx], 1), False,
+                device=device, max_seq_len=history_cap
             )
 
             # Episode end?

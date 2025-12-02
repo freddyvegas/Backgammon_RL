@@ -28,14 +28,16 @@ import backgammon
 import pubeval_player as pubeval
 import random_player as randomAgent
 import flipped_agent as flipped_util
+import gnu_backgammon_player as gnubg_player
 
 import ppo_agent as ppo_agent
 import ppo_transformer_agent as transformer_agent
 import a2c_micro_agent as a2c_agent
+import agent_td_lambda_baseline as baseline_agent
 
 from opponent_pool import OpponentPool
 from utils import (
-    _ensure_dir, _safe_save_agent, plot_perf,
+    _ensure_dir, _safe_save_agent, plot_perf, plot_perf_multi,
     _is_empty_move, _apply_move_sequence,
     flip_to_pov_plus1, get_device
 )
@@ -52,6 +54,20 @@ if torch.cuda.is_available():
 
 # Local checkpoint directory
 CHECKPOINT_DIR = "./checkpoints"
+
+
+def resolve_agent_module(algo: str, agent_type: str):
+    """Return (module_name, class_name) for initializing opponents/checkpoints."""
+    if algo == "ppo":
+        module = "ppo_transformer_agent" if agent_type == "transformer" else "ppo_agent"
+        cls_name = "PPOAgent"
+    elif algo == "baseline-td":
+        module = "agent_td_lambda_baseline"
+        cls_name = "TDLambdaAgent"
+    else:
+        module = "a2c_micro_agent"
+        cls_name = "MicroA2CAgent"
+    return module, cls_name
 
 
 # =========================
@@ -75,6 +91,7 @@ class TrainingState:
     pool_max_size: int
     pool_sample_rate: float
     pubeval_sample_rate: float
+    gnubg_sample_rate: float
     random_sample_rate: float
     use_eval_lookahead: bool
     eval_lookahead_k: int
@@ -83,6 +100,8 @@ class TrainingState:
     n_eval_league: int
     timestamp: str
     agent_type: str           # "MLP" or "transformer" (PPO only, ignored for A2C)
+    agent_module_name: str
+    agent_class_name: str
 
     # Curriculum tuning
     pool_start_games: int = 5_000
@@ -102,17 +121,19 @@ class TrainingState:
     next_snapshot_at: int = 0
     best_wr: float = 0.0
     perf_data: dict = field(default_factory=lambda: {
-        'vs_baseline': [],
-        'vs_baseline_lookahead': [],
-        'vs_random': [],
-        'vs_league_avg': [],
-        'vs_latest_checkpoint': []
-    })
+    'vs_baseline': [],
+    'vs_baseline_lookahead': [],
+    'vs_random': [],
+    'vs_gnubg': [],
+    'vs_league_avg': [],
+    'vs_latest_checkpoint': []
+})
     opponent_stats: dict = field(default_factory=lambda: {
         'self_play': 0,
         'pool': 0,
         'pool_best': 0,
         'pubeval': 0,
+        'gnubg': 0,
         'random': 0
     })
 
@@ -132,23 +153,25 @@ def initialize_training(
     use_opponent_pool=True,
     pool_snapshot_every=5_000,
     pool_max_size=12,
-    pool_sample_rate=0.45,
-    pubeval_sample_rate=0.30,
-    random_sample_rate=0.25,
+    pool_sample_rate=0.30,
+    pubeval_sample_rate=0.05,
+    gnubg_sample_rate=0.15,   
+    random_sample_rate=0.00,
     use_eval_lookahead=True,
     eval_lookahead_k=3,
     use_bc_warmstart=False,
     league_checkpoint_every=20_000,
     n_eval_league=50,
     device='cpu',
-    agent_type='MLP',      # PPO only
+    agent_type='MLP',
     resume=None,
     batch_size=8
 ) -> TrainingState:
 
     algo = algo.lower()
-    if algo not in ("ppo", "micro-a2c"):
-        raise ValueError(f"Unsupported algo '{algo}', use 'ppo' or 'micro-a2c'.")
+    if algo not in ("ppo", "micro-a2c", "baseline-td"):
+        raise ValueError(f"Unsupported algo '{algo}', use 'ppo' or 'micro-a2c', or 'baseline-td'.")
+    agent_module_name, agent_class_name = resolve_agent_module(algo, agent_type)
 
     print("\n" + "=" * 70)
     print(f"{'PPO' if algo == 'ppo' else 'MICRO-A2C'} TRAINING")
@@ -174,15 +197,13 @@ def initialize_training(
         else:
             cfg = ppo_agent.get_config(model_size)
             agent_instance = ppo_agent.PPOAgent(config=cfg, device=device)
+    elif algo == "baseline-td":  # NEW: Add baseline option
+        import agent_td_lambda_baseline as baseline_agent
+        cfg = baseline_agent.get_config(model_size)
+        agent_instance = baseline_agent.TDLambdaAgent(config=cfg, device=device)
     else:  # Micro-A2C
         cfg = a2c_agent.get_config(model_size)
         agent_instance = a2c_agent.MicroA2CAgent(config=cfg, device=device)
-
-    # Resume if requested
-    if resume is not None:
-        # Path objects are usually fine, but to be safe, cast to str
-        agent_instance.load(str(resume))
-
     start_step = agent_instance.steps
 
     # -------- Checkpoint paths --------
@@ -190,12 +211,20 @@ def initialize_training(
     _ensure_dir(checkpoint_base_path)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    # Use different prefixes for PPO vs A2C
-    ckpt_tag = "ppo" if algo == "ppo" else "micro_a2c"
+    # Use different prefixes for PPO vs A2C vs Baseline
+    if algo == "ppo":
+        ckpt_tag = "ppo"
+    elif algo == "baseline-td":
+        ckpt_tag = "baseline_td"
+    else:
+        ckpt_tag = "micro_a2c"
 
     if algo == "ppo":
         # Keep PPO's global CHECKPOINT_PATH behavior
-        ppo_agent.CHECKPOINT_PATH = checkpoint_base_path / f"best_{ckpt_tag}_{model_size}_{timestamp}.pt"
+        ppo_module = transformer_agent if agent_type == 'transformer' else ppo_agent
+        ppo_module.CHECKPOINT_PATH = checkpoint_base_path / f"best_{ckpt_tag}_{model_size}_{timestamp}.pt"
+    elif algo == "baseline-td":
+        baseline_agent.CHECKPOINT_PATH = checkpoint_base_path / f"best_{ckpt_tag}_{model_size}_{timestamp}.pt"
     else:
         a2c_agent.CHECKPOINT_PATH = checkpoint_base_path / f"best_{ckpt_tag}_{model_size}_{timestamp}.pt"
 
@@ -206,11 +235,10 @@ def initialize_training(
     opponent_pool = None
     if use_opponent_pool:
         pool_dir = checkpoint_base_path / f"opponent_pool_{ckpt_tag}_{model_size}"
-        pool_agent_module = "ppo_agent" if algo == "ppo" else "a2c_micro_agent"
 
         opponent_pool = OpponentPool(
             pool_dir=pool_dir,
-            agent_module_name=pool_agent_module,
+            agent_module_name=agent_module_name,
             max_size=pool_max_size,
             seed=RANDOM_SEED,
             device=device
@@ -242,11 +270,18 @@ def initialize_training(
     # -------- League --------
     league = CheckpointLeague(
         checkpoint_dir=checkpoint_base_path / f"league_{ckpt_tag}_{model_size}",
-        agent_module_name="ppo_agent" if algo == "ppo" else "a2c_micro_agent"
+        agent_module_name=agent_module_name
     )
 
     # -------- Baseline --------
-    baseline = pubeval if eval_vs == "pubeval" else randomAgent
+    if eval_vs == "pubeval":
+        baseline = pubeval
+    elif eval_vs == "gnubg":
+        baseline = gnubg_player
+    elif eval_vs == "random":
+        baseline = randomAgent
+    else:
+        baseline = gnubg_player
 
     state = TrainingState(
         # Static / config
@@ -264,6 +299,7 @@ def initialize_training(
         pool_max_size=pool_max_size,
         pool_sample_rate=pool_sample_rate,
         pubeval_sample_rate=pubeval_sample_rate,
+        gnubg_sample_rate=gnubg_sample_rate,
         random_sample_rate=random_sample_rate,
         use_eval_lookahead=use_eval_lookahead,
         eval_lookahead_k=eval_lookahead_k,
@@ -272,6 +308,8 @@ def initialize_training(
         n_eval_league=n_eval_league,
         timestamp=timestamp,
         agent_type=agent_type,
+        agent_module_name=agent_module_name,
+        agent_class_name=agent_class_name,
 
         # Runtime
         agent_instance=agent_instance,
@@ -312,6 +350,52 @@ def initialize_training(
 # =========================
 # One training step
 # =========================
+def play_single_game(agent_obj, opponent, training=True):
+    """Play a single game for non-batched agents."""
+    board = backgammon.init_board()
+    player = 1
+    
+    if hasattr(agent_obj, 'episode_start'):
+        agent_obj.episode_start()
+    if hasattr(opponent, 'episode_start'):
+        opponent.episode_start()
+    
+    while not backgammon.game_over(board):
+        dice = backgammon.roll_dice()
+        n_moves = 2 if dice[0] == dice[1] else 1
+        
+        for i in range(n_moves):
+            if backgammon.game_over(board):
+                break
+            
+            if player == 1:
+                move = agent_obj.action(board.copy(), dice, player, i, train=training)
+            else:
+                if hasattr(opponent, 'action'):
+                    move = opponent.action(board.copy(), dice, player, i, train=False)
+                else:
+                    # Module-style opponent (pubeval, random)
+                    board_flipped = flipped_util.flip_board(board.copy())
+                    move = opponent.action(board_flipped, dice, 1, i)
+                    if len(move) > 0:
+                        move = flipped_util.flip_move(move)
+            
+            if len(move) > 0:
+                board = backgammon.update_board(board, move, player)
+            
+            if backgammon.game_over(board):
+                break
+        
+        player = -player
+    
+    winner = 1 if board[27] == 15 else -1
+    
+    if hasattr(agent_obj, 'end_episode'):
+        agent_obj.end_episode(winner, board, perspective=1)
+    if hasattr(opponent, 'end_episode'):
+        opponent.end_episode(winner, board, perspective=-1)
+    
+    return winner
 
 def train_step(state: TrainingState, train_bar: tqdm):
     """Run one batched rollout of complete games and handle pool snapshots if thresholds are crossed."""
@@ -338,14 +422,15 @@ def train_step(state: TrainingState, train_bar: tqdm):
         bias_recent = state.games_done >= state.pool_ramp_end
         if random.random() < 0.5 and state.best_ckpt_path.exists():
             try:
-                if state.algo == "ppo":
-                    agent_mod = importlib.import_module("ppo_agent")
-                    OppClass = getattr(agent_mod, "PPOAgent")
-                    opponent = OppClass(device=state.device)
-                else:
-                    agent_mod = importlib.import_module("a2c_micro_agent")
-                    OppClass = getattr(agent_mod, "MicroA2CAgent")
-                    opponent = OppClass(device=state.device)
+                agent_mod = importlib.import_module(state.agent_module_name)
+                OppClass = getattr(agent_mod, state.agent_class_name)
+                opp_kwargs = {'device': state.device}
+                if hasattr(agent_mod, 'get_config'):
+                    try:
+                        opp_kwargs['config'] = agent_mod.get_config(state.model_size)
+                    except Exception:
+                        pass
+                opponent = OppClass(**opp_kwargs)
 
                 opponent.load(str(state.best_ckpt_path), map_location=state.device, load_optimizer=False)
                 opponent.set_eval_mode(True)
@@ -356,10 +441,13 @@ def train_step(state: TrainingState, train_bar: tqdm):
         else:
             opponent = state.opponent_pool.sample_opponent(bias_recent=bias_recent)
             opponent_type = 'pool' if opponent is not None else 'self_play'
-    elif r < effective_pool_rate + state.pubeval_sample_rate:
+    elif r < effective_pool_rate + state.gnubg_sample_rate:  # CHANGED: GNU BG instead of pubeval
+        opponent = gnubg_player
+        opponent_type = 'gnubg'
+    elif r < effective_pool_rate + state.gnubg_sample_rate + state.pubeval_sample_rate:  # NEW: Pubeval secondary
         opponent = pubeval
         opponent_type = 'pubeval'
-    elif r < effective_pool_rate + state.pubeval_sample_rate + state.random_sample_rate:
+    elif r < effective_pool_rate + state.gnubg_sample_rate + state.pubeval_sample_rate + state.random_sample_rate:
         opponent = randomAgent
         opponent_type = 'random'
 
@@ -367,8 +455,16 @@ def train_step(state: TrainingState, train_bar: tqdm):
         opponent = ai
         opponent_type = 'self_play'
 
-    # Play batch
-    if state.algo == "ppo" and state.agent_type == 'transformer':
+    # Play batch or sequential
+    if state.algo == "baseline-td":
+        # Baseline TD-lambda doesn't support batching - play sequentially
+        finished = 0
+        for _ in range(state.batch_size):
+            winner = play_single_game(ai, opponent, training=True)
+            finished += 1
+            if state.games_done + finished >= state.n_games:
+                break
+    elif state.algo == "ppo" and state.agent_type == 'transformer':
         finished = play_games_batched_transformer(ai, opponent, batch_size=state.batch_size, training=True)
     else:
         finished = play_games_batched(ai, opponent, batch_size=state.batch_size, training=True)
@@ -383,7 +479,7 @@ def train_step(state: TrainingState, train_bar: tqdm):
 
     # Progress bar postfix
     if state.games_done % 100 == 0 or state.games_done == state.n_games:
-        postfix = {"steps": f"{ai.steps:,}", "upd": ai.updates}
+        postfix = {"steps": f"{ai.steps:,}", "upd": ai.updates}  # Initialize postfix HERE
 
         if state.algo == "ppo":
             if hasattr(ai, 'rollout_stats') and isinstance(ai.rollout_stats, dict):
@@ -397,7 +493,7 @@ def train_step(state: TrainingState, train_bar: tqdm):
                     postfix["VL"] = f"{val_loss[-1]:.3f}"
                 if grad_norm:
                     postfix["∇"] = f"{grad_norm[-1]:.2f}"
-        else:  # Micro-A2C stats
+        else:  # Micro-A2C or baseline-td stats
             if hasattr(ai, 'stats') and isinstance(ai.stats, dict):
                 stats = ai.stats
                 td_errors = stats.get('td_errors', [])
@@ -414,13 +510,20 @@ def train_step(state: TrainingState, train_bar: tqdm):
         if total_opp_games > 0:
             postfix["self%"] = f"{100.0 * state.opponent_stats['self_play'] / total_opp_games:.0f}"
             postfix["pool%"] = f"{100.0 * state.opponent_stats['pool'] / total_opp_games:.0f}"
+            postfix["gnubg%"] = f"{100.0 * state.opponent_stats['gnubg'] / total_opp_games:.0f}"
             postfix["pub%"]  = f"{100.0 * state.opponent_stats['pubeval'] / total_opp_games:.0f}"
             postfix["rnd%"]  = f"{100.0 * state.opponent_stats['random'] / total_opp_games:.0f}"
 
         train_bar.set_postfix(postfix)
 
     # Pool snapshot thresholds
-    ckpt_tag = "ppo" if state.algo == "ppo" else "micro_a2c"
+    if state.algo == "baseline-td":
+        ckpt_tag = "baseline_td"
+    elif state.algo == "ppo":
+        ckpt_tag = "ppo"
+    else:
+        ckpt_tag = "micro_a2c"
+
     while state.use_opponent_pool and state.opponent_pool and state.games_done >= state.next_snapshot_at and state.next_snapshot_at > 0:
         print(f"\n{'='*60}")
         print(f"SNAPSHOT CHECKPOINT at {state.games_done:,} games")
@@ -474,7 +577,7 @@ def train_step(state: TrainingState, train_bar: tqdm):
 # =========================
 
 def validation_step(state: TrainingState):
-    """Run one or more evaluation cycles if thresholds are reached."""
+    """Run comprehensive evaluation against multiple opponents."""
     ai = state.agent_instance
     ran_eval = False
 
@@ -482,39 +585,60 @@ def validation_step(state: TrainingState):
         ran_eval = True
         print()
         ai.set_eval_mode(True)
+        
         # Save latest checkpoint
         ai.save(str(state.latest_ckpt_path))
         print("[Eval] Agent in EVAL mode")
-        print(f"\n--- Evaluation after {state.next_eval_at:,} games ---")
-
-        wr = evaluate(ai, state.baseline, state.n_eval,
-                      label=f"vs {state.eval_vs} (greedy)",
-                      debug_sides=False, use_lookahead=False)
-        state.perf_data['vs_baseline'].append(wr)
-
-        if wr > state.best_wr:
-            state.best_wr = wr
+        print(f"\n{'='*70}")
+        print(f"EVALUATION AFTER {state.next_eval_at:,} GAMES")
+        print(f"{'='*70}")
+        
+        # Evaluate vs GNU Backgammon FIRST (primary metric)
+        try:
+            wr_gnubg = evaluate(ai, gnubg_player, state.n_eval,  # Use full n_eval for primary metric
+                               label="vs GNU Backgammon",
+                               debug_sides=False, use_lookahead=False)
+            if 'vs_gnubg' not in state.perf_data:
+                state.perf_data['vs_gnubg'] = []
+            state.perf_data['vs_gnubg'].append(wr_gnubg)
+        except Exception as e:
+            print(f"  ⚠️  GNU BG evaluation failed: {e}")
+            wr_gnubg = 0.0
+            if 'vs_gnubg' not in state.perf_data:
+                state.perf_data['vs_gnubg'] = []
+            state.perf_data['vs_gnubg'].append(0.0)
+        
+        # Evaluate vs Pubeval (secondary)
+        wr_pubeval = evaluate(ai, pubeval, max(50, state.n_eval // 2),
+                             label="vs Pubeval",
+                             debug_sides=False, use_lookahead=False)
+        state.perf_data['vs_baseline'].append(wr_pubeval)
+        
+        # Evaluate vs Random (sanity check)
+        wr_random = evaluate(ai, randomAgent, max(50, state.n_eval // 2),
+                            label="vs Random",
+                            debug_sides=False, use_lookahead=False)
+        state.perf_data['vs_random'].append(wr_random)
+        
+        # Summary
+        print(f"\n{'='*70}")
+        print(f"EVALUATION SUMMARY")
+        print(f"{'='*70}")
+        print(f"  vs GNU BG:        {wr_gnubg:5.1f}%  ⭐ PRIMARY")
+        print(f"  vs Pubeval:       {wr_pubeval:5.1f}%")
+        print(f"  vs Random:        {wr_random:5.1f}%")
+        print(f"{'='*70}\n")
+        
+        # Check if new best (use GNU BG as primary metric)
+        if wr_gnubg > state.best_wr:
+            state.best_wr = wr_gnubg
             ai.save(str(state.best_ckpt_path))
-            print(f"  🌟 NEW BEST vs {state.eval_vs}: {wr:.1f}% (saved to {state.best_ckpt_path.name})")
-
-        if state.use_eval_lookahead:
-            wr_lookahead = evaluate(
-                ai, state.baseline, min(100, state.n_eval),
-                label=f"vs {state.eval_vs}",
-                debug_sides=False, use_lookahead=True,
-                lookahead_k=state.eval_lookahead_k
-            )
-            state.perf_data['vs_baseline_lookahead'].append(wr_lookahead)
-            print(f"  Lookahead improvement: +{(wr_lookahead - wr):.1f}% points")
-
-        wr_rand = evaluate(
-            ai, randomAgent, max(50, state.n_eval // 2),
-            label="vs random", debug_sides=False, use_lookahead=False
-        )
-        state.perf_data['vs_random'].append(wr_rand)
-        if wr_rand < 50.0:
-            print(f"  ⚠️  WARNING: Only {wr_rand:.1f}% vs random!")
-
+            print(f"  🌟 NEW BEST vs GNU BG: {wr_gnubg:.1f}% (saved to {state.best_ckpt_path.name})")
+        
+        # Warning checks
+        if wr_random < 60.0:
+            print(f"  ⚠️  WARNING: Only {wr_random:.1f}% vs random!")
+        
         ai.set_eval_mode(False)
         state.next_eval_at += state.n_epochs
 
@@ -535,9 +659,10 @@ def train(
     use_opponent_pool=True,
     pool_snapshot_every=5_000,
     pool_max_size=12,
-    pool_sample_rate=0.45,
-    pubeval_sample_rate=0.30,
-    random_sample_rate=0.25,
+    pool_sample_rate=0.30,
+    pubeval_sample_rate=0.10,
+    gnubg_sample_rate=0.15,      
+    random_sample_rate=0.00,
     use_eval_lookahead=True,
     eval_lookahead_k=3,
     use_bc_warmstart=False,
@@ -554,8 +679,11 @@ def train(
         n_games=n_games, n_epochs=n_epochs, n_eval=n_eval, eval_vs=eval_vs,
         model_size=model_size, use_opponent_pool=use_opponent_pool,
         pool_snapshot_every=pool_snapshot_every, pool_max_size=pool_max_size,
-        pool_sample_rate=pool_sample_rate, pubeval_sample_rate=pubeval_sample_rate,
-        random_sample_rate=random_sample_rate, use_eval_lookahead=use_eval_lookahead,
+        pool_sample_rate=pool_sample_rate, 
+        pubeval_sample_rate=pubeval_sample_rate,
+        gnubg_sample_rate=gnubg_sample_rate, 
+        random_sample_rate=random_sample_rate, 
+        use_eval_lookahead=use_eval_lookahead,
         eval_lookahead_k=eval_lookahead_k, use_bc_warmstart=use_bc_warmstart,
         league_checkpoint_every=league_checkpoint_every, n_eval_league=n_eval_league,
         device=device, agent_type=agent_type, resume=resume, batch_size=batch_size
@@ -589,12 +717,14 @@ def train(
     if total_games > 0:
         for opp_type, count in state.opponent_stats.items():
             pct = 100.0 * count / total_games
-            print(f"  {opp_type.capitalize()}: {count:,} ({pct:.1f}%)")
+            marker = " ⭐" if opp_type == "gnubg" else ""
+            print(f"  {opp_type.capitalize()}: {count:,} ({pct:.1f}%){marker}")
 
     print()
-    print(f"Final best win-rate vs {state.eval_vs}: {state.best_wr:.1f}%")
-    if state.perf_data['vs_league_avg']:
-        print(f"Final league average: {state.perf_data['vs_league_avg'][-1]:.1f}%")
+    print(f"Final Performance Summary:")
+    print(f"  vs GNU BG:   {state.perf_data['vs_gnubg'][-1]:.1f}%  ⭐ PRIMARY")
+    print(f"  vs Pubeval:  {state.perf_data['vs_baseline'][-1]:.1f}%")
+    print(f"  vs Random:   {state.perf_data['vs_random'][-1]:.1f}%")
 
     ai = state.agent_instance
     print()
@@ -624,8 +754,16 @@ def train(
 
     print("=" * 70)
 
-    title_prefix = "PPO" if state.algo == "ppo" else "Micro-A2C"
-    plot_perf(
+    # Determine title based on algorithm
+    if state.algo == "ppo":
+        title_prefix = "PPO"
+    elif state.algo == "baseline-td":
+        title_prefix = "TD(λ) After-State Baseline"
+    else:
+        title_prefix = "Micro-A2C"
+
+    # Plot with all three opponents
+    plot_perf_multi(
         state.perf_data, 0, n_games, n_epochs,
         title=f"{title_prefix} Training ({state.model_size.upper()} model)",
         timestamp=state.timestamp
@@ -639,8 +777,8 @@ def train(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Unified trainer for PPO / Micro-A2C agents for backgammon')
     parser.add_argument('--algo', type=str, default='ppo',
-                        choices=['ppo', 'micro-a2c'],
-                        help='Which algorithm to train')
+                    choices=['ppo', 'micro-a2c', 'baseline-td'],
+                    help='Which algorithm to train')
     parser.add_argument('--model-size', type=str, default='large',
                         choices=['small', 'medium', 'large'],
                         help='Model size: small (CPU), medium (M1/M2/T4 GPU), large (good GPU)')
@@ -670,7 +808,7 @@ if __name__ == "__main__":
         print("  Games: 10,000")
         print("  Eval every: 2,500 games")
         print("  Eval games: 100")
-        print("  Baseline: pubeval")
+        print("  Baseline: gnubg")
         print("  Lookahead: disabled")
         print("=" * 70 + "\n")
 
@@ -679,11 +817,12 @@ if __name__ == "__main__":
             n_games=10_000,
             n_epochs=2_500,
             n_eval=100,
-            eval_vs="pubeval",
+            eval_vs="gnubg",
             model_size='small',
             use_opponent_pool=False,   # start without pool
             pool_snapshot_every=5_000,
-            pubeval_sample_rate=0.30,
+            gnubg_sample_rate=0.40,
+            pubeval_sample_rate=0.10,
             random_sample_rate=0.10,
             use_eval_lookahead=False,
             eval_lookahead_k=3,
@@ -700,14 +839,15 @@ if __name__ == "__main__":
             n_games=args.n_games,
             n_epochs=args.n_epochs,
             n_eval=200,
-            eval_vs="pubeval",
+            eval_vs="gnubg",
             model_size=args.model_size,
             use_opponent_pool=True,
             pool_snapshot_every=5_000,
             pool_max_size=12,
-            pool_sample_rate=0.40,
+            pool_sample_rate=0.35,
+            gnubg_sample_rate=0.40,
             pubeval_sample_rate=0.10,
-            random_sample_rate=0.00,
+            random_sample_rate=0.10,
             use_eval_lookahead=False,
             eval_lookahead_k=3,
             device=args.device,

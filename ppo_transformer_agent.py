@@ -47,6 +47,8 @@ class Config:
     # Transformer / tokenization
     max_seq_len = 64              # N: use last N tokens from history
     use_bos_token = True          # Learnable BOS token at start of sequence
+    limit_history_to_max_seq = True  # Clip env histories to avoid unbounded growth
+    vectorize_candidate_encoding = True  # Encode legal moves in a single tensor op
 
     # Transformer sizes (LARGE default)
     d_model = 512

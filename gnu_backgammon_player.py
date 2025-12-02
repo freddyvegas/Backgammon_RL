@@ -86,11 +86,28 @@ def _normalize_gnubg_move(result: Sequence) -> List[Tuple[int, int]]:
 
 
 def _tan_move_to_env(move_pairs: List[Tuple[int, int]], player: int) -> np.ndarray:
-    """Convert gnubg's move pairs back into our absolute board orientation."""
+    """
+    Convert gnubg's move pairs back into our absolute board orientation.
+
+    - gnubg returns up to four steps for doubles; we only execute at most two
+      per env action, so we keep the leading pairs.
+    - gnubg encodes bearing off as destination 0, whereas our env uses 27/28.
+    """
     if not move_pairs:
         return np.empty((0, 2), dtype=np.int32)
 
-    arr = np.array(move_pairs, dtype=np.int32)
+    trimmed = move_pairs[:2]  # environment plays two dice per action
+    arr = np.array(trimmed, dtype=np.int32)
+    if arr.ndim == 1:
+        arr = arr.reshape(1, 2)
+
+    # Map gnubg's off-board index (0) to our borne-off slot (27).
+    # Player -1 will be flipped below which turns 27 into 28.
+    off_mask = arr[:, 1] == 0
+    if np.any(off_mask):
+        arr = arr.copy()
+        arr[off_mask, 1] = 27
+
     if player == -1:
         arr = flipped_agent.flip_move(arr)
     return arr
