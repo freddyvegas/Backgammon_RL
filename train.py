@@ -102,8 +102,8 @@ class TrainingState:
     agent_type: str           # "MLP" or "transformer" (PPO only, ignored for A2C)
     agent_module_name: str
     agent_class_name: str
-    slow_opponent_batch: int = 1
     ckpt_tag: str
+    slow_opponent_batch: int = 1
 
     # Curriculum tuning
     pool_start_games: int = 5_000
