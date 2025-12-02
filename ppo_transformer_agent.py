@@ -6,7 +6,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 import random
-from utils import _flip_board, _flip_move, one_hot_encoding, one_hot_encoding_torch, get_device
+from utils import (
+    _flip_board,
+    _flip_move,
+    transformer_one_hot_encoding,
+    transformer_one_hot_encoding_torch,
+    transformer_start_token,
+    pad_truncate_seq,
+    get_device,
+    TRANSFORMER_STATE_DIM,
+)
 import backgammon
 
 """
@@ -40,8 +49,8 @@ Notes:
 # ---------------- Config ----------------
 class Config:
     """Base configuration with Transformer hyperparameters and PPO settings."""
-    # Input feature dim (293 from user's one-hot encoder)
-    state_dim = 293
+    # Input feature dim (augmented transformer tokens)
+    state_dim = TRANSFORMER_STATE_DIM
     max_actions = 64
 
     # Transformer / tokenization
@@ -442,6 +451,8 @@ class PPOAgent:
         # History of POV states (29-dim raw) and features (293-dim one-hot) for the current episode
         self._history_states29: List[np.ndarray] = []
         self._history_feats293: List[np.ndarray] = []
+        self._history_has_start: bool = True
+        self._start_token_np = transformer_start_token()
 
         self.rollout_stats = {
             'policy_loss': [],
@@ -460,8 +471,8 @@ class PPOAgent:
         print(f"  Max seq: {self.config.max_seq_len}, BOS={self.config.use_bos_token}")
 
     # -------- Utility encoders and rewards --------
-    def _encode_state(self, board29, moves_left=0):
-        return one_hot_encoding(board29.astype(np.float32), bool(moves_left > 1))
+    def _encode_state(self, board29, moves_left=0, actor_flag=0.0):
+        return transformer_one_hot_encoding(board29.astype(np.float32), bool(moves_left > 1), actor_flag)
 
     def _compute_shaped_reward(self, board_before, board_after):
         if not self.config.use_reward_shaping:
@@ -587,13 +598,14 @@ class PPOAgent:
         if torch.is_tensor(cand_states):
             cand_t = cand_states.to(self.device, dtype=torch.float32)
             if cand_t.shape[-1] != self.config.state_dim:
-                # (B, A, 29) -> (B, A, 293) via vectorized torch encoder
-                cand_t = one_hot_encoding_torch(cand_t, nSecondRoll=False)
+                actor_val = torch.ones(cand_t.shape[:-1], dtype=torch.float32, device=self.device)
+                cand_t = transformer_one_hot_encoding_torch(cand_t, nSecondRoll=False, actor_flag=actor_val)
         else:
             cand_np = np.asarray(cand_states, dtype=np.float32)
             cand_t = torch.from_numpy(cand_np).to(self.device)
             if cand_t.shape[-1] != self.config.state_dim:
-                cand_t = one_hot_encoding_torch(cand_t, nSecondRoll=False)
+                actor_val = torch.ones(cand_t.shape[:-1], dtype=torch.float32, device=self.device)
+                cand_t = transformer_one_hot_encoding_torch(cand_t, nSecondRoll=False, actor_flag=actor_val)
 
         # ---- Masks ----
         if torch.is_tensor(masks):
@@ -664,7 +676,8 @@ class PPOAgent:
                 else:
                     flags_t = torch.zeros(take, dtype=torch.float32, device=self.device)
 
-                tokens_t = one_hot_encoding_torch(boards29_t, flags_t)
+                actor_zero = torch.zeros_like(flags_t)
+                tokens_t = transformer_one_hot_encoding_torch(boards29_t, flags_t, actor_zero)
                 seq_pad_t[i, :take, :] = tokens_t
                 true_lens_t[i] = take
 
@@ -674,14 +687,16 @@ class PPOAgent:
             if torch.is_tensor(states):
                 S_t = states.to(self.device, dtype=torch.float32)
                 if S_t.shape[-1] != D:
-                    S_t = one_hot_encoding_torch(S_t, nSecondRoll=False)
+                    zeros_flag = torch.zeros(S_t.shape[:-1], dtype=torch.float32, device=self.device)
+                    S_t = transformer_one_hot_encoding_torch(S_t, nSecondRoll=False, actor_flag=zeros_flag)
             else:
                 states_np = np.asarray(states, dtype=np.float32)
                 states_t = torch.from_numpy(states_np).to(self.device)
                 if states_t.shape[-1] == D:
                     S_t = states_t
                 else:
-                    S_t = one_hot_encoding_torch(states_t, nSecondRoll=False)
+                    zeros_flag = torch.zeros(states_t.shape[:-1], dtype=torch.float32, device=self.device)
+                    S_t = transformer_one_hot_encoding_torch(states_t, nSecondRoll=False, actor_flag=zeros_flag)
 
             seq_pad_t = torch.zeros((B, N, D), dtype=torch.float32, device=self.device)
             seq_pad_t[:, 0, :] = S_t
@@ -701,7 +716,8 @@ class PPOAgent:
             if states_t.shape[-1] == D:
                 S_all = states_t
             else:
-                S_all = one_hot_encoding_torch(states_t, nSecondRoll=False)
+                zeros_flag = torch.zeros(states_t.shape[:-1], dtype=torch.float32, device=self.device)
+                S_all = transformer_one_hot_encoding_torch(states_t, nSecondRoll=False, actor_flag=zeros_flag)
 
             idxs = torch.nonzero(zero_len_mask, as_tuple=False).view(-1)
             seq_pad_t[idxs, 0, :] = S_all[idxs]
@@ -863,15 +879,14 @@ class PPOAgent:
     # -------- Sequence helpers --------
     def _get_sequence_feats(self) -> Tuple[np.ndarray, int]:
         """Return (seq_feats[L,293], true_len) truncated to last N, optionally with BOS handled in model."""
-        Lfull = len(self._history_feats293)
-        N = self.config.max_seq_len
-        take = min(Lfull, N)
-        seq = self._history_feats293[-take:] if take > 0 else []
-        if take == 0:
-            # If no history, still supply the current state when called by action(); caller ensures it
-            return np.zeros((0, self.config.state_dim), dtype=np.float32), 0
-        seq_arr = np.stack(seq, axis=0).astype(np.float32)
-        return seq_arr, take
+        seq_padded, seq_len = pad_truncate_seq(
+            self._history_feats293,
+            self.config.max_seq_len,
+            self.config.state_dim,
+            start_token=self._start_token_np,
+            has_start=self._history_has_start
+        )
+        return seq_padded, seq_len
 
     def _build_seq_batch(self, seq_arr: np.ndarray) -> Tuple[np.ndarray, int]:
         L = seq_arr.shape[0]
@@ -884,6 +899,16 @@ class PPOAgent:
             L = N
         return seq_padded, L
 
+    def _append_history_feature(self, feat: np.ndarray):
+        self._history_feats293.append(feat.copy())
+        limit = self.config.max_seq_len - 1 if self._history_has_start else self.config.max_seq_len
+        if len(self._history_feats293) > limit:
+            overflow = len(self._history_feats293) - limit
+            if overflow > 0:
+                del self._history_feats293[:overflow]
+                if self._history_has_start:
+                    self._history_has_start = False
+
     # -------- Action selection --------
     def action(self, board_copy, dice, player, i, train=False, train_config=None):
         """Select an action given current board + dice. Maintains sequence history."""
@@ -895,20 +920,18 @@ class PPOAgent:
 
         # Moves left flag for encoder
         moves_left = 1 + int(dice[0] == dice[1]) - i
-        cur_feat = self._encode_state(board_pov, moves_left)
+        cur_feat = self._encode_state(board_pov, moves_left, actor_flag=0.0)
 
         # Update history with *current state* as final token for prediction
         self._history_states29.append(board_pov.copy())
-        self._history_feats293.append(cur_feat.copy())
+        self._append_history_feature(cur_feat)
 
         # Build sequence (truncate to last N)
-        seq_np, true_len = self._get_sequence_feats()
-        # Ensure we include the current token (it is already appended)
-        seq_padded, L_eff = self._build_seq_batch(seq_np)
+        seq_padded, true_len = self._get_sequence_feats()
 
         # Candidate features (after-states)
         cand_feats = np.stack([
-            self._encode_state(b_after, moves_left - 1) for b_after in possible_boards
+            self._encode_state(b_after, moves_left - 1, actor_flag=1.0) for b_after in possible_boards
         ], axis=0).astype(np.float32)
 
         # Cap candidates
@@ -945,6 +968,11 @@ class PPOAgent:
 
         chosen_move = possible_moves[a_idx]
         chosen_board = possible_boards[a_idx]
+
+        # Append post-action token (agent move)
+        post_feat = self._encode_state(chosen_board, moves_left - 1, actor_flag=1.0)
+        self._append_history_feature(post_feat)
+        self._history_states29.append(chosen_board.copy())
 
         # Reward signal
         terminal_reward = 1.0 if (chosen_board[27] == 15) else 0.0
@@ -991,6 +1019,7 @@ class PPOAgent:
     def episode_start(self):
         self._history_states29.clear()
         self._history_feats293.clear()
+        self._history_has_start = True
 
     def end_episode(self, outcome, final_board, perspective):
         # Could log episode-level stats here if desired
@@ -1025,7 +1054,7 @@ class PPOAgent:
                     sec_flags = np.full((S29.shape[0],), bool(assume_second_roll))
 
                 S_feat = np.stack(
-                    [one_hot_encoding(S29[i], bool(sec_flags[i])) for i in range(S29.shape[0])],
+                    [transformer_one_hot_encoding(S29[i], bool(sec_flags[i]), actor_flag=0.0) for i in range(S29.shape[0])],
                     axis=0
                 ).astype(np.float32)
 
@@ -1035,7 +1064,7 @@ class PPOAgent:
                 for i in range(B):
                     for a in range(A):
                         if M[i, a] != 0.0:
-                            C_feat[i, a] = one_hot_encoding(C29[i, a], False)
+                            C_feat[i, a] = transformer_one_hot_encoding(C29[i, a], False, actor_flag=1.0)
 
                 # Pack tensors
                 # Build 1-token sequences (or 0 with BOS-only; we'll use 1)

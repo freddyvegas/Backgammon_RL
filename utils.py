@@ -6,6 +6,8 @@ import torch
 
 
 STATE_DIM = 24 * 2 * 6 + 4 + 1  # 293
+TRANSFORMER_EXTRA_FEATURES = 2   # actor flag + start indicator
+TRANSFORMER_STATE_DIM = STATE_DIM + TRANSFORMER_EXTRA_FEATURES
 
 def get_device():
     """
@@ -83,6 +85,15 @@ def one_hot_encoding(board29, nSecondRoll: bool):
 
     return oneHot
 
+def transformer_one_hot_encoding(board29, nSecondRoll: bool, actor_flag: float):
+    """One-hot features with actor flag and start indicator slot."""
+    base = one_hot_encoding(board29, nSecondRoll)
+    token = np.zeros(TRANSFORMER_STATE_DIM, dtype=np.float32)
+    token[:STATE_DIM] = base
+    token[-2] = 1.0 if actor_flag > 0 else 0.0  # actor channel
+    token[-1] = 0.0  # start indicator (set elsewhere)
+    return token
+
 def one_hot_encoding_torch(board29_t, nSecondRoll):
     if not torch.is_tensor(board29_t):
         board29_t = torch.as_tensor(board29_t, dtype=torch.float32)
@@ -123,6 +134,25 @@ def one_hot_encoding_torch(board29_t, nSecondRoll):
     out[..., 12 * 24 + 4] = flag
 
     return out
+
+def transformer_one_hot_encoding_torch(board29_t, nSecondRoll, actor_flag):
+    """Torch variant of transformer token encoding."""
+    base = one_hot_encoding_torch(board29_t, nSecondRoll)
+    if torch.is_tensor(actor_flag):
+        actor_val = actor_flag.to(dtype=torch.float32, device=base.device)
+    else:
+        actor_val = torch.as_tensor(float(actor_flag > 0), dtype=torch.float32, device=base.device)
+    extra_shape = base.shape[:-1] + (1,)
+    actor_tensor = actor_val.expand(extra_shape)
+    start_tensor = torch.zeros_like(actor_tensor)
+    return torch.cat([base, actor_tensor, start_tensor], dim=-1)
+
+def transformer_start_token():
+    """Return a numpy start-of-game token."""
+    token = np.zeros(TRANSFORMER_STATE_DIM, dtype=np.float32)
+    token[-2] = 0.0
+    token[-1] = 1.0
+    return token
 
 
 # --- Checkpoint helpers ---
@@ -243,27 +273,45 @@ def flip_to_pov_plus1(board: np.ndarray, player: int) -> np.ndarray:
     out[28] = -b[27]
     return out
 
-def append_token(histories293, hist_lens, idx, board29, nSecondRoll_flag, one_hot_encoding_fn):
+def append_token(histories293, hist_lens, idx, board29, nSecondRoll_flag, one_hot_encoding_fn,
+                 max_seq_len=None, start_flags=None):
     """
-    Append a new 293-dim token to the per-environment history.
+    Append a new token to the per-environment history with optional truncation.
 
     Args:
-        histories293: list[list[np.ndarray(293,)]]
-            Global per-env list of token sequences.
+        histories293: list[list[np.ndarray]]
         hist_lens: list[int]
-            Parallel list of current sequence lengths.
         idx: int
-            Environment index to update.
         board29: np.ndarray (29,)
-            Current +1 POV board representation.
         nSecondRoll_flag: bool
-            Whether this token should include the 'second roll' context bit.
-        one_hot_encoding_fn: callable(board29, nSecondRoll_flag) -> np.ndarray(293,)
+        one_hot_encoding_fn: callable returning feature vector
+        max_seq_len: optional cap on history length
+        start_flags: optional list[bool]; when True reserves one slot for start token
+    Returns:
+        True if the oldest tokens were removed due to truncation.
     """
     token = one_hot_encoding_fn(board29.astype(np.float32), nSecondRoll_flag)
     if hist_lens[idx] == 0 or not np.array_equal(histories293[idx][-1], token):
         histories293[idx].append(token)
         hist_lens[idx] += 1
+
+    if max_seq_len is None:
+        return False
+
+    removed = False
+    limit = max_seq_len
+    if start_flags is not None and start_flags[idx]:
+        limit = max(1, max_seq_len - 1)
+
+    while hist_lens[idx] > limit:
+        del histories293[idx][0]
+        hist_lens[idx] -= 1
+        removed = True
+        if start_flags is not None and start_flags[idx]:
+            start_flags[idx] = False
+            limit = max_seq_len
+
+    return removed
 
 def append_token_torch(histories293, hist_lens, idx, board29, nSecondRoll_flag, device=None, max_seq_len=None):
     """Append a tokenized observation to an env history with optional truncation."""
@@ -280,27 +328,27 @@ def append_token_torch(histories293, hist_lens, idx, board29, nSecondRoll_flag, 
                 hist_lens[idx] = max_seq_len
 
 
-def pad_truncate_seq(seq_list, max_seq_len, state_dim):
+def pad_truncate_seq(seq_list, max_seq_len, state_dim, start_token=None, has_start=False):
     """
-    Pad or truncate a list of 293-d tokens into a (max_seq_len, state_dim) array.
+    Pad or truncate a list of tokens (optionally prefixed with a learnable start token).
 
     Args:
-        seq_list: list[np.ndarray(293,)] — tokenized state history.
+        seq_list: list[np.ndarray] — tokenized state history.
         max_seq_len: int — maximum sequence length.
-        state_dim: int — feature dimension per token (usually 293).
-
-    Returns:
-        seq_padded: np.ndarray (max_seq_len, state_dim)
-        seq_len: int — number of valid tokens (after truncation).
+        state_dim: int — feature dimension per token.
+        start_token: optional np.ndarray(state_dim,) representing start sentinel.
+        has_start: bool — whether the episode still includes the start token.
     """
-    L = len(seq_list)
+    tokens = seq_list
+    if has_start and start_token is not None:
+        tokens = [start_token] + tokens
+    L = len(tokens)
     take = min(L, max_seq_len)
     seq_padded = np.zeros((max_seq_len, state_dim), dtype=np.float32)
     if take > 0:
-        seq_slice = np.stack(seq_list[L - take:L], axis=0).astype(np.float32)
+        seq_slice = np.stack(tokens[L - take:L], axis=0).astype(np.float32)
         seq_padded[:take, :] = seq_slice
     else:
-        seq_padded[0, :] = np.zeros((state_dim,), dtype=np.float32)
         take = 1
     return seq_padded, take
 
@@ -325,7 +373,7 @@ def pad_truncate_seq_torch(history_tokens, N, D):
     return seq.cpu().numpy(), seq_len_out
 
 
-def build_histories_batch(histories293, hist_lens):
+def build_histories_batch(histories293, hist_lens, max_seq_len=None, state_dim=STATE_DIM):
     """
     Build a padded batch (B, L_max, D) and corresponding length vector (B,)
     from per-env histories. Used before batch_score calls.
@@ -333,21 +381,37 @@ def build_histories_batch(histories293, hist_lens):
     Args:
         histories293: list[list[np.ndarray(293,)]]
         hist_lens: list[int]
+        max_seq_len: optional int to clamp/truncate histories
+        state_dim: feature dimension (defaults to STATE_DIM)
 
     Returns:
-        hist_pad: np.ndarray (B, L_max, 293)
+        hist_pad: np.ndarray (B, L_max, state_dim)
         hist_len: np.ndarray (B,)
     """
     B = len(histories293)
-    D = histories293[0][0].shape[-1] if histories293[0] else 293
-    L_max = max(1, max(hist_lens))
+    if B == 0:
+        L_max = max_seq_len if max_seq_len is not None else 1
+        return np.zeros((0, L_max, state_dim), dtype=np.float32), np.zeros(0, dtype=np.int64)
+
+    D = state_dim
+    if max_seq_len is not None:
+        L_max = max(1, max_seq_len)
+    else:
+        L_max = max(1, max(hist_lens))
+
     hist_pad = np.zeros((B, L_max, D), dtype=np.float32)
+    hist_len = np.zeros(B, dtype=np.int64)
+
     for i in range(B):
         L_i = hist_lens[i]
+        if max_seq_len is not None and L_i > max_seq_len:
+            L_i = max_seq_len
         if L_i > 0:
-            seq_i = np.stack(histories293[i], axis=0).astype(np.float32)
+            seq_i = np.stack(histories293[i][-L_i:], axis=0).astype(np.float32)
             hist_pad[i, :L_i, :] = seq_i
-    return hist_pad, np.asarray(hist_lens, dtype=np.int64)
+        hist_len[i] = max(1, L_i)
+
+    return hist_pad, hist_len
 
 def build_histories_batch_torch(h_batch, h_lens, device=None):
     B = len(h_batch)

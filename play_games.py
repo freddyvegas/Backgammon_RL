@@ -4,12 +4,13 @@ import random_player as randomAgent
 import flipped_agent as flipped_util
 from utils import (
     one_hot_encoding,
+    transformer_one_hot_encoding,
+    transformer_start_token,
     flip_to_pov_plus1,
     _is_empty_move,
     _apply_move_sequence,
     append_token,
     pad_truncate_seq,
-    build_histories_batch,
 )
 import numpy as np
 import torch
@@ -354,6 +355,7 @@ def play_games_batched_transformer(agent_obj, opponent, batch_size=8, training=T
     # Per-env histories of tokens (+1 POV) stored as numpy arrays for light-weight book-keeping
     histories293 = [[] for _ in range(batch_size)]
     hist_lens    = [0  for _ in range(batch_size)]
+    history_has_start = [True for _ in range(batch_size)]
 
     # Shorthands
     N    = agent_obj.config.max_seq_len
@@ -362,6 +364,8 @@ def play_games_batched_transformer(agent_obj, opponent, batch_size=8, training=T
 
     # Device for model execution
     device = agent_obj.device if hasattr(agent_obj, "device") else agent_obj.config.device
+
+    start_token_np = transformer_start_token()
 
     # ---- Initialize games and seed history with initial token ----
     for i in range(batch_size):
@@ -375,7 +379,11 @@ def play_games_batched_transformer(agent_obj, opponent, batch_size=8, training=T
         passes_left.append(2 if dice[0] == dice[1] else 1)
 
         board_pov = flip_to_pov_plus1(board, 1)
-        append_token(histories293, hist_lens, i, board_pov, (passes_left[i] > 1), one_hot_encoding)
+        append_token(
+            histories293, hist_lens, i, board_pov, (passes_left[i] > 1),
+            lambda b, sr, actor=0.0: transformer_one_hot_encoding(b, sr, actor),
+            max_seq_len=N, start_flags=history_has_start
+        )
 
     # ---- Main loop ----
     while any(env_active):
@@ -404,14 +412,18 @@ def play_games_batched_transformer(agent_obj, opponent, batch_size=8, training=T
             batch_cand_states = []
             batch_masks = []
             per_env_candidates = []
-            h_batch = []
-            h_lens = []
+            seq_batch = []
+            seq_len_batch = []
 
             for (idx, dice, board, pmoves, pboards) in agent_envs:
                 board_pov = flip_to_pov_plus1(board, 1).astype(np.float32)
                 moves_left = passes_left[idx]
 
-                append_token(histories293, hist_lens, idx, board_pov, (moves_left > 1), one_hot_encoding)
+                append_token(
+                    histories293, hist_lens, idx, board_pov, (moves_left > 1),
+                    lambda b, sr, actor=0.0: transformer_one_hot_encoding(b, sr, actor),
+                    max_seq_len=N, start_flags=history_has_start
+                )
 
                 cand_feats = np.zeros((Amax, D), dtype=np.float32)
                 mask = np.zeros(Amax, dtype=np.float32)
@@ -420,27 +432,31 @@ def play_games_batched_transformer(agent_obj, opponent, batch_size=8, training=T
                 nSecondRoll_next = ((passes_left[idx] - 1) > 1)
                 for a in range(nA):
                     after29 = flip_to_pov_plus1(pboards[a], 1).astype(np.float32)
-                    cand_feats[a] = one_hot_encoding(after29, nSecondRoll_next)
+                    cand_feats[a] = transformer_one_hot_encoding(after29, nSecondRoll_next, actor_flag=1.0)
                     mask[a] = 1.0
 
-                batch_states.append(one_hot_encoding(board_pov, (moves_left > 1)))
+                batch_states.append(transformer_one_hot_encoding(board_pov, (moves_left > 1), actor_flag=0.0))
                 batch_cand_states.append(cand_feats)
                 batch_masks.append(mask)
                 per_env_candidates.append((idx, pmoves, pboards))
 
-                h_batch.append(histories293[idx])
-                h_lens.append(hist_lens[idx])
+                seq_pad, seq_len = pad_truncate_seq(
+                    histories293[idx], N, D, start_token_np, history_has_start[idx]
+                )
+                seq_batch.append(seq_pad)
+                seq_len_batch.append(seq_len)
 
             states_np = np.stack(batch_states, axis=0)
             cand_states_np = np.stack(batch_cand_states, axis=0)
             masks_np = np.stack(batch_masks, axis=0)
-            hist_pad_np, hist_len_np = build_histories_batch(h_batch, h_lens)
+            seq_batch_np = np.stack(seq_batch, axis=0)
+            seq_len_np = np.asarray(seq_len_batch, dtype=np.int64)
 
             states_t = torch.as_tensor(states_np, dtype=torch.float32, device=device)
             cand_states_t = torch.as_tensor(cand_states_np, dtype=torch.float32, device=device)
             masks_t = torch.as_tensor(masks_np, dtype=torch.float32, device=device)
-            hist_pad_t = torch.as_tensor(hist_pad_np, dtype=torch.float32, device=device)
-            hist_len_t = torch.as_tensor(hist_len_np, dtype=torch.int64, device=device)
+            hist_pad_t = torch.as_tensor(seq_batch_np, dtype=torch.float32, device=device)
+            hist_len_t = torch.as_tensor(seq_len_np, dtype=torch.int64, device=device)
 
             logits, values = agent_obj.batch_score(
                 states_t, cand_states_t, masks_t,
@@ -486,12 +502,15 @@ def play_games_batched_transformer(agent_obj, opponent, batch_size=8, training=T
                 append_token(
                     histories293, hist_lens, idx,
                     flip_to_pov_plus1(boards[idx], 1), False,
-                    one_hot_encoding
+                    lambda b, sr, actor=1.0: transformer_one_hot_encoding(b, sr, actor),
+                    max_seq_len=N, start_flags=history_has_start
                 )
 
                 # Push transformer tuple to per-env rollout (training only)
                 if training and not agent_obj.eval_mode:
-                    seq_padded_np, seq_len = pad_truncate_seq(histories293[idx], N, D)
+                    seq_padded_np, seq_len = pad_truncate_seq(
+                        histories293[idx], N, D, start_token_np, history_has_start[idx]
+                    )
 
                     value = values[row].item() if hasattr(values[row], 'item') else float(values[row])
                     cand_np = batch_cand_states[row]
@@ -541,7 +560,8 @@ def play_games_batched_transformer(agent_obj, opponent, batch_size=8, training=T
             append_token(
                 histories293, hist_lens, idx,
                 flip_to_pov_plus1(boards[idx], 1), False,
-                one_hot_encoding
+                lambda b, sr, actor=0.0: transformer_one_hot_encoding(b, sr, actor),
+                max_seq_len=N, start_flags=history_has_start
             )
 
             # Episode end?
@@ -554,7 +574,9 @@ def play_games_batched_transformer(agent_obj, opponent, batch_size=8, training=T
                         per_env_rollouts[idx][-1] = (SEQ_, SEQL_, C_, M_, A_, LP_, V_ + 0.0, R_ + loss_reward, 1.0, T_)
                     else:
                         # Fabricate a 1-step terminal sample from current history
-                        seq_padded_np, seq_len = pad_truncate_seq(histories293[idx], N, D)
+                        seq_padded_np, seq_len = pad_truncate_seq(
+                            histories293[idx], N, D, start_token_np, history_has_start[idx]
+                        )
                         C_feats = np.zeros((Amax, D), dtype=np.float32)
                         C_feats[0] = seq_padded_np[max(0, seq_len - 1)]
                         M = np.zeros(Amax, dtype=np.float32); M[0] = 1.0
