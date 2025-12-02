@@ -100,6 +100,9 @@ class Config:
     teacher_loss_coef_end = 0.0
     teacher_decay_horizon = 50_000
 
+    # Compilation / performance knobs
+    compile_model = False
+
 
 class SmallConfig(Config):
     """Small model for CPU training / quick tests."""
@@ -135,6 +138,7 @@ class LargeConfig(Config):
     rollout_length = 640
     minibatch_size = 160
     ppo_epochs = 3
+    compile_model = True
 
 
 def get_config(size='large'):
@@ -157,6 +161,7 @@ def get_config(size='large'):
     print(f"  PPO clip ε: {cfg.clip_epsilon} (gentler)")
     print(f"  PPO epochs: {cfg.ppo_epochs} (gentler)")
     print(f"  Teacher signal: {cfg.teacher_sample_rate*100:.0f}% sample rate")
+    print(f"  torch.compile: {cfg.compile_model}")
     return cfg
 
 
@@ -274,10 +279,15 @@ class TransformerActorCritic(nn.Module):
         )
 
         # Positional embeddings
-        self.pos_emb = nn.Parameter(torch.zeros(1, max_seq_len + int(use_bos_token), d_model))
+        pos_tokens = max_seq_len + int(use_bos_token)
+        self.pos_emb = nn.Parameter(torch.zeros(1, pos_tokens, d_model))
 
         # Optional BOS token (learnable)
         self.bos = nn.Parameter(torch.zeros(1, 1, d_model)) if use_bos_token else None
+
+        # Pre-computed causal mask (trimmed at runtime)
+        causal = torch.triu(torch.ones(pos_tokens, pos_tokens, dtype=torch.bool), diagonal=1)
+        self.register_buffer("causal_mask_cache", causal, persistent=False)
 
         # Transformer blocks
         self.blocks = nn.ModuleList([
@@ -306,8 +316,8 @@ class TransformerActorCritic(nn.Module):
             nn.init.normal_(self.bos, std=0.02)
 
     def _causal_mask(self, L: int, device: torch.device):
-        # PyTorch MultiheadAttention expects attn_mask shape (L, L) with True (or -inf)
-        # to mask future positions. We'll use a boolean mask.
+        if hasattr(self, "causal_mask_cache") and self.causal_mask_cache.size(0) >= L:
+            return self.causal_mask_cache[:L, :L]
         mask = torch.triu(torch.ones(L, L, dtype=torch.bool, device=device), diagonal=1)
         return mask
 
@@ -411,7 +421,12 @@ class PPOAgent:
             attn_dropout=self.config.attn_dropout,
         ).to(self.device)
 
-        self.acnet = torch.compile(self.acnet)
+        if getattr(torch, "compile", None) and getattr(self.config, "compile_model", False):
+            try:
+                self.acnet = torch.compile(self.acnet)
+                print("  torch.compile enabled for TransformerActorCritic")
+            except Exception as compile_err:
+                print(f"  torch.compile unavailable ({compile_err}); continuing without it.")
 
         self.optimizer = torch.optim.AdamW(
             self.acnet.parameters(), lr=self.config.lr, weight_decay=self.config.weight_decay
