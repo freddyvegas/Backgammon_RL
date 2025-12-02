@@ -536,6 +536,18 @@ class PPOAgent:
                     resid_dropout=self.config.resid_dropout,
                     attn_dropout=self.config.attn_dropout,
                 ).to(self.device)
+            # Sync current config with saved architecture
+            for key, default in [
+                ('state_dim', self.config.state_dim),
+                ('d_model', self.config.d_model),
+                ('n_layers', self.config.n_layers),
+                ('n_heads', self.config.n_heads),
+                ('d_ff', self.config.d_ff),
+                ('max_seq_len', self.config.max_seq_len),
+                ('use_bos_token', self.config.use_bos_token),
+            ]:
+                if key in saved_config:
+                    setattr(self.config, key, saved_config[key])
         self.acnet.load_state_dict(checkpoint['acnet'])
         if load_optimizer and 'optimizer' in checkpoint:
             self.optimizer.load_state_dict(checkpoint['optimizer'])

@@ -102,6 +102,7 @@ class TrainingState:
     agent_type: str           # "MLP" or "transformer" (PPO only, ignored for A2C)
     agent_module_name: str
     agent_class_name: str
+    slow_opponent_batch: int = 1
     ckpt_tag: str
 
     # Curriculum tuning
@@ -284,6 +285,8 @@ def initialize_training(
     else:
         baseline = gnubg_player
 
+    slow_batch = max(1, batch_size // 4)
+
     state = TrainingState(
         # Static / config
         algo=algo,
@@ -312,6 +315,7 @@ def initialize_training(
         agent_module_name=agent_module_name,
         agent_class_name=agent_class_name,
         ckpt_tag=ckpt_tag,
+        slow_opponent_batch=slow_batch,
 
         # Runtime
         agent_instance=agent_instance,
@@ -443,13 +447,10 @@ def train_step(state: TrainingState, train_bar: tqdm):
         else:
             opponent = state.opponent_pool.sample_opponent(bias_recent=bias_recent)
             opponent_type = 'pool' if opponent is not None else 'self_play'
-    elif r < effective_pool_rate + state.gnubg_sample_rate:  # CHANGED: GNU BG instead of pubeval
-        opponent = gnubg_player
-        opponent_type = 'gnubg'
-    elif r < effective_pool_rate + state.gnubg_sample_rate + state.pubeval_sample_rate:  # NEW: Pubeval secondary
+    elif r < effective_pool_rate + state.pubeval_sample_rate:
         opponent = pubeval
         opponent_type = 'pubeval'
-    elif r < effective_pool_rate + state.gnubg_sample_rate + state.pubeval_sample_rate + state.random_sample_rate:
+    elif r < effective_pool_rate + state.pubeval_sample_rate + state.random_sample_rate:
         opponent = randomAgent
         opponent_type = 'random'
 
@@ -474,10 +475,28 @@ def train_step(state: TrainingState, train_bar: tqdm):
     if state.games_done + finished > state.n_games:
         finished = state.n_games - state.games_done
 
+    # Optional slow-opponent (gnubg) mini-batch to keep throughput stable
+    slow_finished = 0
+    if (
+        state.gnubg_sample_rate > 0.0
+        and state.games_done + finished < state.n_games
+        and random.random() < state.gnubg_sample_rate
+    ):
+        slow_batch = min(state.slow_opponent_batch, state.n_games - (state.games_done + finished))
+        if slow_batch > 0:
+            slow_finished = play_games_batched_transformer(
+                ai, gnubg_player, batch_size=slow_batch, training=True
+            )
+            slow_finished = min(slow_finished, state.n_games - (state.games_done + finished))
+
+    total_finished = finished + slow_finished
+
     # Accounting
-    state.games_done += finished
-    train_bar.update(finished)
+    state.games_done += total_finished
+    train_bar.update(total_finished)
     state.opponent_stats[opponent_type] += finished
+    if slow_finished:
+        state.opponent_stats['gnubg'] += slow_finished
 
     # Progress bar postfix
     if state.games_done % 100 == 0 or state.games_done == state.n_games:
