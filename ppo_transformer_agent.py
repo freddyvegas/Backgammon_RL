@@ -125,7 +125,14 @@ class MediumConfig(Config):
 
 class LargeConfig(Config):
     """Large model (default)."""
-    pass
+    d_model = 640
+    n_layers = 10
+    n_heads = 10
+    d_ff = 2560
+    max_seq_len = 64
+    rollout_length = 640
+    minibatch_size = 160
+    ppo_epochs = 3
 
 
 def get_config(size='large'):

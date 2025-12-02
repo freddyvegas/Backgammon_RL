@@ -262,9 +262,13 @@ def pad_truncate_seq_torch(history_tokens, N, D):
 
     seq = torch.zeros((N, D), dtype=torch.float32)
     if seq_len > 0:
-        seq[-seq_len:] = torch.stack(history_tokens[-seq_len:], dim=0)
+        recent = torch.stack(history_tokens[-seq_len:], dim=0).to(device=seq.device, dtype=torch.float32)
+        seq[:seq_len, :] = recent
+        seq_len_out = seq_len
+    else:
+        seq_len_out = 1  # keep at least one timestep for downstream math
 
-    return seq.cpu().numpy(), seq_len
+    return seq.cpu().numpy(), seq_len_out
 
 
 def build_histories_batch(histories293, hist_lens):
@@ -311,4 +315,3 @@ def build_histories_batch_torch(h_batch, h_lens, device=None):
             hist_pad[i, :L_i, :] = seq_i
 
     return hist_pad, hist_len
-

@@ -59,6 +59,11 @@ class Config:
     # Network architecture (ResMLP) - DEFAULT: LARGE
     model_dim = 512
     n_blocks = 6
+    ff_mult = 2.0
+    resid_dropout = 0.0
+    delta_hidden_mult = 1.5
+    value_hidden_mult = 0.5
+    compile_model = False
 
     # Gradient clipping
     grad_clip = 0.5
@@ -83,17 +88,26 @@ class Config:
     teacher_loss_coef_end = 0.0     # Final teacher loss coefficient (decay to 0)
     teacher_decay_horizon = 50_000  # Decay over this many games
 
+    # Learning-rate schedule (warmup + cosine decay)
+    lr_warmup_updates = 100
+    lr_cosine_updates = 3000
+    lr_min_ratio = 0.2
+
 
 class SmallConfig(Config):
     """Small model for CPU training / quick testing."""
     model_dim = 128
     n_blocks = 3
+    ff_mult = 1.5
+    resid_dropout = 0.05
     rollout_length = 256
     minibatch_size = 64
     lr = 5e-5  # Gentler
     ppo_epochs = 2  # Gentler
     clip_epsilon = 0.1  # Gentler
     use_reward_shaping = False
+    lr_warmup_updates = 50
+    lr_cosine_updates = 2000
 
 
 class MediumConfig(Config):
@@ -102,11 +116,23 @@ class MediumConfig(Config):
     n_blocks = 4
     rollout_length = 384
     minibatch_size = 96
+    resid_dropout = 0.025
 
 
 class LargeConfig(Config):
     """Large model (default) for full GPU training."""
-    pass
+    model_dim = 640
+    n_blocks = 8
+    ff_mult = 2.5
+    resid_dropout = 0.0
+    delta_hidden_mult = 2.0
+    value_hidden_mult = 1.0
+    rollout_length = 640
+    minibatch_size = 160
+    lr = 4e-5
+    clip_epsilon = 0.08
+    ppo_epochs = 3
+    compile_model = True
 
 
 def get_config(size='large'):
@@ -125,12 +151,13 @@ def get_config(size='large'):
 
     print(f"\nModel Configuration: {size.upper()}")
     print(f"  Parameters: ~{'80K' if size == 'small' else '400K' if size == 'medium' else '1.6M'}")
-    print(f"  Architecture: dim={cfg.model_dim}, blocks={cfg.n_blocks}")
+    print(f"  Architecture: dim={cfg.model_dim}, blocks={cfg.n_blocks}, ff_mult={cfg.ff_mult}")
     print(f"  Rollout: length={cfg.rollout_length}, batch={cfg.minibatch_size}")
     print(f"  Learning rate: {cfg.lr} (gentler)")
     print(f"  PPO clip ε: {cfg.clip_epsilon} (gentler)")
     print(f"  PPO epochs: {cfg.ppo_epochs} (gentler)")
     print(f"  Teacher signal: {cfg.teacher_sample_rate*100:.0f}% sample rate")
+    print(f"  LR schedule: warmup={cfg.lr_warmup_updates}, cosine={cfg.lr_cosine_updates}, min_ratio={cfg.lr_min_ratio}")
 
     return cfg
 
@@ -203,24 +230,27 @@ class PPORolloutBuffer:
 
 # ------------- Network Architecture -------------
 class ResMLPBlock(nn.Module):
-    """Residual MLP block with proper normalization."""
-    def __init__(self, dim):
+    """Residual MLP block with LayerNorm + wider hidden for faster training."""
+    def __init__(self, dim, ff_mult=2.0, dropout=0.0):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(dim, dim),
-            nn.ReLU(),
-            nn.Linear(dim, dim),
+        hidden_dim = max(dim, int(dim * ff_mult))
+        self.ln = nn.LayerNorm(dim)
+        self.ff = nn.Sequential(
+            nn.Linear(dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, dim),
+            nn.Dropout(dropout),
         )
         self._init_weights()
 
     def _init_weights(self):
-        for m in self.net.modules():
+        for m in self.modules():
             if isinstance(m, nn.Linear):
                 nn.init.orthogonal_(m.weight, gain=np.sqrt(2))
                 nn.init.zeros_(m.bias)
 
     def forward(self, x):
-        return x + self.net(x)
+        return x + self.ff(self.ln(x))
 
 
 class PPOActorCritic(nn.Module):
@@ -229,34 +259,56 @@ class PPOActorCritic(nn.Module):
 
     FIX #1: Constructor now uses correct parameter names (state_dim, model_dim, n_blocks)
     """
-    def __init__(self, state_dim=29, model_dim=512, n_blocks=6):
+    def __init__(self, state_dim=29, model_dim=512, n_blocks=6,
+                 ff_mult=2.0, resid_dropout=0.0,
+                 delta_hidden_mult=1.5, value_hidden_mult=0.5):
         super().__init__()
         self.state_dim = state_dim
         self.model_dim = model_dim
 
-        # State encoder
-        self.state_enc = nn.Linear(state_dim, model_dim)
+        # State encoder (pre-LN + wider MLP)
+        state_hidden = max(model_dim, int(model_dim * ff_mult))
+        self.state_enc = nn.Sequential(
+            nn.LayerNorm(state_dim),
+            nn.Linear(state_dim, state_hidden),
+            nn.GELU(),
+            nn.Linear(state_hidden, model_dim),
+            nn.LayerNorm(model_dim),
+        )
 
         # Residual MLP blocks
         self.blocks = nn.ModuleList([
-            ResMLPBlock(model_dim) for _ in range(n_blocks)
+            ResMLPBlock(model_dim, ff_mult=ff_mult, dropout=resid_dropout)
+            for _ in range(n_blocks)
         ])
 
         # Delta projection (for scoring candidates)
-        self.delta_proj = nn.Linear(state_dim, model_dim)
+        delta_hidden = max(model_dim, int(model_dim * delta_hidden_mult))
+        self.delta_proj = nn.Sequential(
+            nn.LayerNorm(state_dim),
+            nn.Linear(state_dim, delta_hidden),
+            nn.GELU(),
+            nn.Linear(delta_hidden, model_dim),
+        )
 
-        # Value head (single scalar)
-        self.value_head = nn.Linear(model_dim, 1)
+        # Value head (richer MLP)
+        value_hidden = max(model_dim // 2, int(model_dim * value_hidden_mult))
+        self.value_head = nn.Sequential(
+            nn.LayerNorm(model_dim),
+            nn.Linear(model_dim, value_hidden),
+            nn.GELU(),
+            nn.Linear(value_hidden, 1)
+        )
 
         self._init_weights()
 
     def _init_weights(self):
-        nn.init.orthogonal_(self.state_enc.weight, gain=np.sqrt(2))
-        nn.init.zeros_(self.state_enc.bias)
-        nn.init.orthogonal_(self.delta_proj.weight, gain=1.0)
-        nn.init.zeros_(self.delta_proj.bias)
-        nn.init.orthogonal_(self.value_head.weight, gain=1.0)
-        nn.init.zeros_(self.value_head.bias)
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                gain = 1.0 if module.out_features == 1 else np.sqrt(2)
+                nn.init.orthogonal_(module.weight, gain=gain)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
 
     def forward(self, states, deltas, mask):
         """
@@ -273,7 +325,6 @@ class PPOActorCritic(nn.Module):
 
         # Encode state
         s_enc = self.state_enc(states)  # (B, model_dim)
-        s_enc = F.relu(s_enc)
 
         # Process through residual blocks
         x = s_enc
@@ -326,8 +377,18 @@ class PPOAgent:
         self.acnet = PPOActorCritic(
             state_dim=self.config.state_dim,
             model_dim=self.config.model_dim,
-            n_blocks=self.config.n_blocks
+            n_blocks=self.config.n_blocks,
+            ff_mult=self.config.ff_mult,
+            resid_dropout=self.config.resid_dropout,
+            delta_hidden_mult=self.config.delta_hidden_mult,
+            value_hidden_mult=self.config.value_hidden_mult
         ).to(self.device)
+        if getattr(torch, "compile", None) and getattr(self.config, "compile_model", False):
+            try:
+                self.acnet = torch.compile(self.acnet)
+                print("  torch.compile enabled for PPOActorCritic")
+            except Exception as compile_err:
+                print(f"  torch.compile unavailable ({compile_err}); continuing without it.")
 
         # Optimizer
         self.optimizer = torch.optim.AdamW(
@@ -335,6 +396,12 @@ class PPOAgent:
             lr=self.config.lr,
             weight_decay=self.config.weight_decay
         )
+        self.lr_scheduler = None
+        if getattr(self.config, "lr_warmup_updates", 0) > 0 or getattr(self.config, "lr_cosine_updates", 0) > 0:
+            self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
+                self.optimizer,
+                lr_lambda=self._build_lr_lambda()
+            )
 
         # Rollout buffer
         self.buffer = PPORolloutBuffer(rollout_length=self.config.rollout_length)
@@ -363,6 +430,25 @@ class PPOAgent:
         print(f"  PPO epochs: {self.config.ppo_epochs} (gentler)")
         print(f"  Max grad norm: {self.config.max_grad_norm}")
         print(f"  Teacher signal: {self.config.teacher_sample_rate*100:.0f}% sample rate")
+        if self.lr_scheduler is not None:
+            print(f"  LR schedule active (warmup={self.config.lr_warmup_updates}, cosine={self.config.lr_cosine_updates})")
+
+    def _build_lr_lambda(self):
+        """Warmup + cosine decay schedule for PPO updates."""
+        warmup = max(0, int(getattr(self.config, "lr_warmup_updates", 0)))
+        cosine = max(0, int(getattr(self.config, "lr_cosine_updates", 0)))
+        min_ratio = float(getattr(self.config, "lr_min_ratio", 0.2))
+
+        def lr_lambda(update_idx: int):
+            if warmup > 0 and update_idx < warmup:
+                return max(1e-3, float(update_idx + 1) / float(warmup))
+            if cosine > 0:
+                progress = min(1.0, max(0.0, (update_idx - warmup) / max(1, float(cosine))))
+                cosine_factor = 0.5 * (1.0 + math.cos(math.pi * progress))
+                return max(min_ratio, cosine_factor)
+            return 1.0
+
+        return lr_lambda
 
     def _encode_state(self, board29, moves_left=0):
         """Return 293-dim one-hot features (net input)."""
@@ -746,6 +832,8 @@ class PPOAgent:
         )
 
         self.updates += 1
+        if self.lr_scheduler is not None:
+            self.lr_scheduler.step()
 
         # Print update info periodically
         if self.updates % 10 == 0:
@@ -757,6 +845,9 @@ class PPOAgent:
             print(f"  Teacher loss: {total_teacher_loss / n_updates:.4f} (α={alpha:.4f})")
             print(f"  Grad norm: {grad_norm:.4f}")
             print(f"  Entropy coef: {self.current_entropy_coef:.6f}")
+            if self.lr_scheduler is not None:
+                current_lr = self.optimizer.param_groups[0]["lr"]
+                print(f"  LR (scheduled): {current_lr:.6e}")
             print(f"  Samples/update: {samples_per_update} | Total samples: {self.steps}")
 
         # Clear buffer
