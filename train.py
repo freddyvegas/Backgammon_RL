@@ -56,6 +56,20 @@ if torch.cuda.is_available():
 CHECKPOINT_DIR = "./checkpoints"
 
 
+def resolve_agent_module(algo: str, agent_type: str):
+    """Return (module_name, class_name) for initializing opponents/checkpoints."""
+    if algo == "ppo":
+        module = "ppo_transformer_agent" if agent_type == "transformer" else "ppo_agent"
+        cls_name = "PPOAgent"
+    elif algo == "baseline-td":
+        module = "agent_td_lambda_baseline"
+        cls_name = "TDLambdaAgent"
+    else:
+        module = "a2c_micro_agent"
+        cls_name = "MicroA2CAgent"
+    return module, cls_name
+
+
 # =========================
 # Core training structures
 # =========================
@@ -86,6 +100,8 @@ class TrainingState:
     n_eval_league: int
     timestamp: str
     agent_type: str           # "MLP" or "transformer" (PPO only, ignored for A2C)
+    agent_module_name: str
+    agent_class_name: str
 
     # Curriculum tuning
     pool_start_games: int = 5_000
@@ -155,6 +171,7 @@ def initialize_training(
     algo = algo.lower()
     if algo not in ("ppo", "micro-a2c", "baseline-td"):
         raise ValueError(f"Unsupported algo '{algo}', use 'ppo' or 'micro-a2c', or 'baseline-td'.")
+    agent_module_name, agent_class_name = resolve_agent_module(algo, agent_type)
 
     print("\n" + "=" * 70)
     print(f"{'PPO' if algo == 'ppo' else 'MICRO-A2C'} TRAINING")
@@ -204,7 +221,8 @@ def initialize_training(
 
     if algo == "ppo":
         # Keep PPO's global CHECKPOINT_PATH behavior
-        ppo_agent.CHECKPOINT_PATH = checkpoint_base_path / f"best_{ckpt_tag}_{model_size}_{timestamp}.pt"
+        ppo_module = transformer_agent if agent_type == 'transformer' else ppo_agent
+        ppo_module.CHECKPOINT_PATH = checkpoint_base_path / f"best_{ckpt_tag}_{model_size}_{timestamp}.pt"
     elif algo == "baseline-td":
         baseline_agent.CHECKPOINT_PATH = checkpoint_base_path / f"best_{ckpt_tag}_{model_size}_{timestamp}.pt"
     else:
@@ -217,16 +235,10 @@ def initialize_training(
     opponent_pool = None
     if use_opponent_pool:
         pool_dir = checkpoint_base_path / f"opponent_pool_{ckpt_tag}_{model_size}"
-        if algo == "ppo":
-            pool_agent_module = "ppo_agent"
-        elif algo == "baseline-td":
-            pool_agent_module = "agent_td_lambda_baseline"
-        else:
-            pool_agent_module = "a2c_micro_agent"
 
         opponent_pool = OpponentPool(
             pool_dir=pool_dir,
-            agent_module_name=pool_agent_module,
+            agent_module_name=agent_module_name,
             max_size=pool_max_size,
             seed=RANDOM_SEED,
             device=device
@@ -256,16 +268,9 @@ def initialize_training(
         print()
 
     # -------- League --------
-    if algo == "ppo":
-        league_agent_module = "ppo_agent"
-    elif algo == "baseline-td":
-        league_agent_module = "agent_td_lambda_baseline"
-    else:
-        league_agent_module = "a2c_micro_agent"
-
     league = CheckpointLeague(
         checkpoint_dir=checkpoint_base_path / f"league_{ckpt_tag}_{model_size}",
-        agent_module_name=league_agent_module
+        agent_module_name=agent_module_name
     )
 
     # -------- Baseline --------
@@ -303,6 +308,8 @@ def initialize_training(
         n_eval_league=n_eval_league,
         timestamp=timestamp,
         agent_type=agent_type,
+        agent_module_name=agent_module_name,
+        agent_class_name=agent_class_name,
 
         # Runtime
         agent_instance=agent_instance,
@@ -415,14 +422,15 @@ def train_step(state: TrainingState, train_bar: tqdm):
         bias_recent = state.games_done >= state.pool_ramp_end
         if random.random() < 0.5 and state.best_ckpt_path.exists():
             try:
-                if state.algo == "ppo":
-                    agent_mod = importlib.import_module("ppo_agent")
-                    OppClass = getattr(agent_mod, "PPOAgent")
-                    opponent = OppClass(device=state.device)
-                else:
-                    agent_mod = importlib.import_module("a2c_micro_agent")
-                    OppClass = getattr(agent_mod, "MicroA2CAgent")
-                    opponent = OppClass(device=state.device)
+                agent_mod = importlib.import_module(state.agent_module_name)
+                OppClass = getattr(agent_mod, state.agent_class_name)
+                opp_kwargs = {'device': state.device}
+                if hasattr(agent_mod, 'get_config'):
+                    try:
+                        opp_kwargs['config'] = agent_mod.get_config(state.model_size)
+                    except Exception:
+                        pass
+                opponent = OppClass(**opp_kwargs)
 
                 opponent.load(str(state.best_ckpt_path), map_location=state.device, load_optimizer=False)
                 opponent.set_eval_mode(True)
@@ -847,5 +855,3 @@ if __name__ == "__main__":
             resume=args.resume,
             batch_size=args.batch_size
         )
-
-
