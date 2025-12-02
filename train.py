@@ -102,6 +102,7 @@ class TrainingState:
     agent_type: str           # "MLP" or "transformer" (PPO only, ignored for A2C)
     agent_module_name: str
     agent_class_name: str
+    ckpt_tag: str
 
     # Curriculum tuning
     pool_start_games: int = 5_000
@@ -213,7 +214,7 @@ def initialize_training(
 
     # Use different prefixes for PPO vs A2C vs Baseline
     if algo == "ppo":
-        ckpt_tag = "ppo"
+        ckpt_tag = "ppo_transformer" if agent_type.lower() == "transformer" else "ppo"
     elif algo == "baseline-td":
         ckpt_tag = "baseline_td"
     else:
@@ -310,6 +311,7 @@ def initialize_training(
         agent_type=agent_type,
         agent_module_name=agent_module_name,
         agent_class_name=agent_class_name,
+        ckpt_tag=ckpt_tag,
 
         # Runtime
         agent_instance=agent_instance,
@@ -517,12 +519,7 @@ def train_step(state: TrainingState, train_bar: tqdm):
         train_bar.set_postfix(postfix)
 
     # Pool snapshot thresholds
-    if state.algo == "baseline-td":
-        ckpt_tag = "baseline_td"
-    elif state.algo == "ppo":
-        ckpt_tag = "ppo"
-    else:
-        ckpt_tag = "micro_a2c"
+    ckpt_tag = state.ckpt_tag
 
     while state.use_opponent_pool and state.opponent_pool and state.games_done >= state.next_snapshot_at and state.next_snapshot_at > 0:
         print(f"\n{'='*60}")
