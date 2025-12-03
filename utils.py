@@ -275,21 +275,7 @@ def flip_to_pov_plus1(board: np.ndarray, player: int) -> np.ndarray:
 
 def append_token(histories293, hist_lens, idx, board29, nSecondRoll_flag, one_hot_encoding_fn,
                  max_seq_len=None, start_flags=None):
-    """
-    Append a new token to the per-environment history with optional truncation.
-
-    Args:
-        histories293: list[list[np.ndarray]]
-        hist_lens: list[int]
-        idx: int
-        board29: np.ndarray (29,)
-        nSecondRoll_flag: bool
-        one_hot_encoding_fn: callable returning feature vector
-        max_seq_len: optional cap on history length
-        start_flags: optional list[bool]; when True reserves one slot for start token
-    Returns:
-        True if the oldest tokens were removed due to truncation.
-    """
+    """Append (and optionally truncate) a tokenized observation to an env history."""
     token = one_hot_encoding_fn(board29.astype(np.float32), nSecondRoll_flag)
     if hist_lens[idx] == 0 or not np.array_equal(histories293[idx][-1], token):
         histories293[idx].append(token)
