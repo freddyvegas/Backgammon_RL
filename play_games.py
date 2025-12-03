@@ -366,6 +366,7 @@ def play_games_batched_transformer(agent_obj, opponent, batch_size=8, training=T
     device = agent_obj.device if hasattr(agent_obj, "device") else agent_obj.config.device
 
     start_token_np = transformer_start_token()
+    env_start_flags = [True for _ in range(batch_size)]
 
     # ---- Initialize games and seed history with initial token ----
     for i in range(batch_size):
@@ -511,7 +512,6 @@ def play_games_batched_transformer(agent_obj, opponent, batch_size=8, training=T
                     seq_padded_np, seq_len = pad_truncate_seq(
                         histories293[idx], N, D, start_token_np, history_has_start[idx]
                     )
-
                     value = values[row].item() if hasattr(values[row], 'item') else float(values[row])
                     cand_np = batch_cand_states[row]
                     mask_np = batch_masks[row]
