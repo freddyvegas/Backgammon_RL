@@ -152,7 +152,11 @@ def initialize_training(
     # Agent + gentle curriculum tweaks
     if agent_type ==  'transformer':
         cfg = transformer_agent.get_config(model_size)
-        agent_instance = transformer_agent.PPOAgent(config=cfg, device=device)
+        agent_instance = transformer_agent.PPOAgent(
+            config=cfg,
+            device=device,
+            pubeval_module=pubeval
+        )
     else:
         cfg = agent.get_config(model_size)
         agent_instance = agent.PPOAgent(config=cfg, device=device)

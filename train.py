@@ -195,7 +195,11 @@ def initialize_training(
     if algo == "ppo":
         if agent_type == 'transformer':
             cfg = transformer_agent.get_config(model_size)
-            agent_instance = transformer_agent.PPOAgent(config=cfg, device=device)
+            agent_instance = transformer_agent.PPOAgent(
+                config=cfg,
+                device=device,
+                pubeval_module=pubeval
+            )
         else:
             cfg = ppo_agent.get_config(model_size)
             agent_instance = ppo_agent.PPOAgent(config=cfg, device=device)
