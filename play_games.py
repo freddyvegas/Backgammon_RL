@@ -14,6 +14,7 @@ from utils import (
 )
 import numpy as np
 import torch
+import random
 
 def play_games_batched(agent_obj, opponent, batch_size=8, training=True):
     """
@@ -97,7 +98,7 @@ def play_games_batched(agent_obj, opponent, batch_size=8, training=True):
                     (agent_obj.config.max_actions, agent_obj.config.state_dim),
                     dtype=np.float32
                 )
-
+                raw_after_states = []
                 mask = np.zeros(agent_obj.config.max_actions, dtype=np.float32)
 
                 nA = min(len(pboards), agent_obj.config.max_actions)
@@ -105,12 +106,14 @@ def play_games_batched(agent_obj, opponent, batch_size=8, training=True):
                     after29 = flip_to_pov_plus1(pboards[a], 1)
                     nSecondRoll_next = (passes_left[idx] - 1) > 1
                     cand_feats[a]  = one_hot_encoding(after29, nSecondRoll_next)
+                    raw_after_states.append(after29.astype(np.float32))
                     mask[a] = 1.0
 
                 batch_states.append(S_feat)
                 batch_cand_states.append(cand_feats)
                 batch_masks.append(mask)
-                per_env_candidates.append((idx, pmoves, pboards))
+                after_states_np = np.stack(raw_after_states, axis=0) if raw_after_states else np.zeros((0, 29), dtype=np.float32)
+                per_env_candidates.append((idx, pmoves, pboards, board_pov, after_states_np))
 
             # Batched forward pass for agent
             states_np = np.stack(batch_states, axis=0)
@@ -133,7 +136,7 @@ def play_games_batched(agent_obj, opponent, batch_size=8, training=True):
                 log_probs = [0.0] * len(a_idxs)
 
             # Apply agent actions
-            for row, (idx, pmoves, pboards) in enumerate(per_env_candidates):
+            for row, (idx, pmoves, pboards, board_pov, raw_after_states) in enumerate(per_env_candidates):
                 a_idx = int(a_idxs[row])
                 if a_idx >= len(pmoves):
                     a_idx = len(pmoves) - 1
@@ -170,11 +173,19 @@ def play_games_batched(agent_obj, opponent, batch_size=8, training=True):
                     log_prob = log_probs[row]
                     value = values[row].item() if hasattr(values[row], 'item') else float(values[row])
 
+                    teacher_idx = -1
+                    if (agent_obj.pubeval is not None and
+                        random.random() < agent_obj.config.teacher_sample_rate):
+                        teacher_idx = agent_obj._get_teacher_label(
+                            board_pov, raw_after_states, mask_for_this
+                        )
+
                     # Push transition to buffer
                     per_env_rollouts[idx].append((
                         state, cand_states_for_this, mask_for_this,
                         a_idx, log_prob, value, reward,
-                        1.0 if (terminal_reward != 0.0) else 0.0
+                        1.0 if (terminal_reward != 0.0) else 0.0,
+                        teacher_idx
                     ))
                     agent_obj.steps += 1
 
@@ -183,8 +194,8 @@ def play_games_batched(agent_obj, opponent, batch_size=8, training=True):
                 if done:
                     env_active[idx] = False
                     # Flush this env's trajectory to the global PPO buffer (keep it contiguous)
-                    for (S_, C_, M_, A_, LP_, V_, R_, D_) in per_env_rollouts[idx]:
-                        agent_obj.buffer.push(S_, C_, M_, A_, LP_, V_, R_, D_)
+                    for (S_, C_, M_, A_, LP_, V_, R_, D_, T_) in per_env_rollouts[idx]:
+                        agent_obj.buffer.push(S_, C_, M_, A_, LP_, V_, R_, D_, T_)
                     per_env_rollouts[idx].clear()
                     # Optionally kick an update here if the global buffer is full
                     if training and not agent_obj.eval_mode and agent_obj.buffer.is_ready():
@@ -245,8 +256,8 @@ def play_games_batched(agent_obj, opponent, batch_size=8, training=True):
                         loss_reward = -1.0 * agent_obj.config.reward_scale
                         if per_env_rollouts[idx]:
                             # Update last transition with loss reward
-                            (S_, C_, M_, A_, LP_, V_, R_, D_) = per_env_rollouts[idx][-1]
-                            per_env_rollouts[idx][-1] = (S_, C_, M_, A_, LP_, V_, R_ + loss_reward, 1.0)
+                            (S_, C_, M_, A_, LP_, V_, R_, D_, T_) = per_env_rollouts[idx][-1]
+                            per_env_rollouts[idx][-1] = (S_, C_, M_, A_, LP_, V_, R_ + loss_reward, 1.0, T_)
                         else:
                             # Rare: agent never acted - fabricate a 1-step terminal sample
                             board_pov29 = flip_to_pov_plus1(boards[idx], 1).astype(np.float32)
@@ -255,12 +266,12 @@ def play_games_batched(agent_obj, opponent, batch_size=8, training=True):
                             C_feats[0] = S_feat
                             M = np.zeros(agent_obj.config.max_actions, dtype=np.float32)
                             M[0] = 1.0
-                            per_env_rollouts[idx].append((S_feat, C_feats, M, 0, 0.0, 0.0, loss_reward, 1.0))
+                            per_env_rollouts[idx].append((S_feat, C_feats, M, 0, 0.0, 0.0, loss_reward, 1.0, -1))
 
                     # Flush this env's trajectory to buffer
                     env_active[idx] = False
-                    for (S_, C_, M_, A_, LP_, V_, R_, D_) in per_env_rollouts[idx]:
-                        agent_obj.buffer.push(S_, C_, M_, A_, LP_, V_, R_, D_)
+                    for (S_, C_, M_, A_, LP_, V_, R_, D_, T_) in per_env_rollouts[idx]:
+                        agent_obj.buffer.push(S_, C_, M_, A_, LP_, V_, R_, D_, T_)
                     per_env_rollouts[idx].clear()
                     if training and not agent_obj.eval_mode and agent_obj.buffer.is_ready():
                         agent_obj._ppo_update()
@@ -441,18 +452,21 @@ def play_games_batched_transformer(agent_obj, opponent, batch_size=8, training=T
 
                 cand_feats = np.zeros((Amax, D), dtype=np.float32)
                 mask = np.zeros(Amax, dtype=np.float32)
+                raw_after_states = []
 
                 nA = min(len(pboards), Amax)
-                nSecondRoll_next = ((passes_left[idx] - 1) > 0)
+                nSecondRoll_next = ((passes_left[idx] - 1) > 1)
                 for a in range(nA):
                     after29 = flip_to_pov_plus1(pboards[a], 1).astype(np.float32)
                     cand_feats[a] = transformer_one_hot_encoding(after29, nSecondRoll_next, actor_flag=1.0)
+                    raw_after_states.append(after29)
                     mask[a] = 1.0
 
                 batch_states.append(transformer_one_hot_encoding(board_pov, (moves_left > 1), actor_flag=0.0))
                 batch_cand_states.append(cand_feats)
                 batch_masks.append(mask)
-                per_env_candidates.append((idx, pmoves, pboards))
+                after_np = np.stack(raw_after_states, axis=0) if raw_after_states else np.zeros((0, 29), dtype=np.float32)
+                per_env_candidates.append((idx, pmoves, pboards, board_pov, after_np))
 
                 seq_pad, seq_len = pad_truncate_seq(
                     histories293[idx], N, D, start_token_np, history_has_start[idx]
@@ -494,7 +508,7 @@ def play_games_batched_transformer(agent_obj, opponent, batch_size=8, training=T
                 log_probs = [0.0] * len(a_idxs)
 
             # Apply actions and record transitions
-            for row, (idx, pmoves, pboards) in enumerate(per_env_candidates):
+            for row, (idx, pmoves, pboards, board_pov, raw_after_states) in enumerate(per_env_candidates):
                 a_idx = int(a_idxs[row])
                 if a_idx >= len(pmoves):  # clamp against padding
                     a_idx = len(pmoves) - 1
@@ -529,12 +543,15 @@ def play_games_batched_transformer(agent_obj, opponent, batch_size=8, training=T
                     value = values[row].item() if hasattr(values[row], 'item') else float(values[row])
                     cand_np = batch_cand_states[row]
                     mask_np = batch_masks[row]
-
+                    teacher_idx = -1
+                    if (agent_obj.pubeval is not None and
+                        random.random() < agent_obj.config.teacher_sample_rate):
+                        teacher_idx = agent_obj._get_teacher_label(board_pov, raw_after_states, mask_np)
                     per_env_rollouts[idx].append((
                         seq_padded_np, int(seq_len),
                         cand_np, mask_np,
                         a_idx, float(log_probs[row]), float(value),
-                        float(reward), float(done), -1  # teacher_idx=-1
+                        float(reward), float(done), teacher_idx
                     ))
                     agent_obj.steps += 1
 
@@ -570,7 +587,7 @@ def play_games_batched_transformer(agent_obj, opponent, batch_size=8, training=T
                     cand_feats = np.zeros((Amax, D), dtype=np.float32)
                     mask = np.zeros(Amax, dtype=np.float32)
                     nA = min(len(pboards), Amax)
-                    nSecondRoll_next = ((passes_left[idx] - 1) > 0)
+                    nSecondRoll_next = ((passes_left[idx] - 1) > 1)
                     for a in range(nA):
                         after29 = flip_to_pov_plus1(pboards[a], -1).astype(np.float32)
                         cand_feats[a] = transformer_one_hot_encoding(after29, nSecondRoll_next, actor_flag=1.0)

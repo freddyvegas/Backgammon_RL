@@ -574,38 +574,27 @@ class PPOAgent:
         returns = advantages + values
         return advantages, returns
 
-    def _get_teacher_label(self, state, deltas, mask):
-        """
-        Get teacher label from pubeval for a state.
-
-        Args:
-            state: (29,) current state
-            deltas: (nA, 29) candidate deltas
-            mask: (nA,) mask for valid actions
-
-        Returns:
-            int: Index of teacher's choice, or -1 if pubeval unavailable
-        """
+    def _get_teacher_label(self, state29, after_states29, mask):
+        """Return pubeval argmax for the provided candidate after-states."""
         if self.pubeval is None:
             return -1
 
         try:
-            nA = int(mask.sum())
-            if nA == 0:
+            cand = np.asarray(after_states29, dtype=np.float32)
+            nA = min(cand.shape[0], int(mask.sum()))
+            if nA <= 0:
                 return -1
 
-            # Score each after-state with pubeval
             scores = []
             for k in range(nA):
-                after = (state + deltas[k]).astype(np.float32)
+                after = cand[k]
                 race = int(self.pubeval.israce(after))
                 pb28 = self.pubeval.pubeval_flip(after)
                 pos = self.pubeval._to_int32_view(pb28)
                 scores.append(float(self.pubeval._pubeval_scalar(race, pos)))
 
             return int(np.argmax(scores))
-        except Exception as e:
-            # If pubeval fails, return -1
+        except Exception:
             return -1
 
     def warmstart_with_pubeval(
@@ -647,12 +636,8 @@ class PPOAgent:
         for _ in range(epochs):
             for S29, C29, M in batch_iter:
                 # -------- teacher labels on 29-dim boards --------
-                # deltas in RAW BOARD space
-                deltas29 = C29 - S29[:, None, :]                            # (B, A, 29)
-                # best-action index per row (mask-aware if your helper supports it)
-                # If your _get_teacher_label signature is (state29, deltas29_row, mask_row) → int:
                 labels = np.array(
-                    [self._get_teacher_label(S29[i], deltas29[i], M[i]) for i in range(S29.shape[0])],
+                    [self._get_teacher_label(S29[i], C29[i], M[i]) for i in range(S29.shape[0])],
                     dtype=np.int64
                 )
 
@@ -892,7 +877,12 @@ class PPOAgent:
                     log_prob_single = log_probs_sa[0, 0].item()
                     value_single = (value_sa.squeeze(-1)[0].item() if value_sa.dim() > 1 else value_sa[0].item())
 
-                self.buffer.push(S, cand_padded, mask_padded, 0, log_prob_single, value_single, total_reward, done, -1)
+                teacher_idx = -1
+                if (self.pubeval is not None and
+                    random.random() < self.config.teacher_sample_rate):
+                    teacher_idx = 0
+
+                self.buffer.push(S, cand_padded, mask_padded, 0, log_prob_single, value_single, total_reward, done, teacher_idx)
                 self.steps += 1
                 if self.buffer.is_ready():
                     self._ppo_update()
@@ -906,17 +896,20 @@ class PPOAgent:
         moves_left = 1 + int(dice[0] == dice[1]) - i
         S = self._encode_state(board_pov, moves_left)
 
-        cand_states = np.stack([
-            self._encode_state(board_after, moves_left - 1)
-            for board_after in possible_boards
-        ], axis=0)
-
         # Cap candidates
         if nA > self.config.max_actions:
-            cand_states = cand_states[:self.config.max_actions]
             possible_moves = possible_moves[:self.config.max_actions]
             possible_boards = possible_boards[:self.config.max_actions]
             nA = self.config.max_actions
+
+        cand_state_list = []
+        after_boards = []
+        for board_after in possible_boards:
+            board_after = board_after.astype(np.float32, copy=False)
+            after_boards.append(board_after)
+            cand_state_list.append(self._encode_state(board_after, moves_left - 1))
+        cand_states = np.stack(cand_state_list, axis=0)
+        after_boards = np.stack(after_boards, axis=0)
 
         deltas = cand_states - S
         mask = np.ones(nA, dtype=np.float32)
@@ -957,8 +950,9 @@ class PPOAgent:
 
         # Get teacher label (NEW!)
         teacher_idx = -1
-        if train and not self.eval_mode and random.random() < self.config.teacher_sample_rate:
-            teacher_idx = self._get_teacher_label(S, deltas, mask)
+        if (train and not self.eval_mode and self.pubeval is not None and
+            random.random() < self.config.teacher_sample_rate):
+            teacher_idx = self._get_teacher_label(board_pov, after_boards, mask)
 
         # Store in buffer
         if train and not self.eval_mode:

@@ -202,7 +202,7 @@ def initialize_training(
             )
         else:
             cfg = ppo_agent.get_config(model_size)
-            agent_instance = ppo_agent.PPOAgent(config=cfg, device=device)
+            agent_instance = ppo_agent.PPOAgent(config=cfg, device=device, pubeval_module=pubeval)
     elif algo == "baseline-td":  # NEW: Add baseline option
         import agent_td_lambda_baseline as baseline_agent
         cfg = baseline_agent.get_config(model_size)

@@ -159,7 +159,7 @@ def initialize_training(
         )
     else:
         cfg = agent.get_config(model_size)
-        agent_instance = agent.PPOAgent(config=cfg, device=device)
+        agent_instance = agent.PPOAgent(config=cfg, device=device, pubeval_module=pubeval)
 
 
     if resume is not None:

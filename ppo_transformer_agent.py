@@ -754,16 +754,17 @@ class PPOAgent:
         return advantages, returns
 
     # -------- Teacher label via pubeval --------
-    def _get_teacher_label(self, state29, deltas29, mask_row):
+    def _get_teacher_label(self, state29, after_states29, mask_row):
         if self.pubeval is None:
             return -1
         try:
-            nA = int(mask_row.sum())
-            if nA == 0:
+            cand = np.asarray(after_states29, dtype=np.float32)
+            nA = min(cand.shape[0], int(mask_row.sum()))
+            if nA <= 0:
                 return -1
             scores = []
             for k in range(nA):
-                after = (state29 + deltas29[k]).astype(np.float32)
+                after = cand[k]
                 race = int(self.pubeval.israce(after))
                 pb28 = self.pubeval.pubeval_flip(after)
                 pos = self.pubeval._to_int32_view(pb28)
@@ -994,12 +995,10 @@ class PPOAgent:
 
         # Teacher label occasionally
         teacher_idx = -1
-        if train and not self.eval_mode and random.random() < self.config.teacher_sample_rate:
-            # Build deltas in 29-dim raw space for pubeval teacher
-            # Note: use the *raw* current board (29) and candidate after-states (29)
+        if (train and not self.eval_mode and self.pubeval is not None and
+            random.random() < self.config.teacher_sample_rate):
             cand29 = np.stack(possible_boards[:nA], axis=0)
-            deltas29 = cand29 - board_pov[None, :]
-            teacher_idx = self._get_teacher_label(board_pov, deltas29, mask)
+            teacher_idx = self._get_teacher_label(board_pov, cand29, mask)
 
         # Buffer push when training
         if train and not self.eval_mode:
@@ -1053,9 +1052,8 @@ class PPOAgent:
         for _ in range(epochs):
             for S29, C29, M in batch_iter:
                 # Teacher labels on raw 29-d boards
-                deltas29 = C29 - S29[:, None, :]
                 labels = np.array(
-                    [self._get_teacher_label(S29[i], deltas29[i], M[i]) for i in range(S29.shape[0])],
+                    [self._get_teacher_label(S29[i], C29[i], M[i]) for i in range(S29.shape[0])],
                     dtype=np.int64
                 )
                 # Encode current state features (single-token sequence)
