@@ -488,7 +488,8 @@ def train_step(state: TrainingState, train_bar: tqdm):
     ):
         slow_batch = min(state.slow_opponent_batch, state.n_games - (state.games_done + finished))
         if slow_batch > 0:
-            slow_finished = play_games_batched_transformer(
+            slow_play_fn = play_games_batched_transformer if state.agent_type == 'transformer' else play_games_batched
+            slow_finished = slow_play_fn(
                 ai, gnubg_player, batch_size=slow_batch, training=True
             )
             slow_finished = min(slow_finished, state.n_games - (state.games_done + finished))

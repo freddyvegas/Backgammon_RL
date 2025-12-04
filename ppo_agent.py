@@ -38,7 +38,7 @@ class Config:
     max_actions = 64
 
     # PPO hyperparameters - GENTLER for stability
-    lr = 5e-5              # Reduced from 1e-4 → 5e-5
+    lr = 1e-4              # Reduced from 1e-4 → 5e-5
     gamma = 0.99
     gae_lambda = 0.95
     clip_epsilon = 0.1     # Reduced from 0.2 → 0.1
@@ -129,7 +129,7 @@ class LargeConfig(Config):
     value_hidden_mult = 1.0
     rollout_length = 640
     minibatch_size = 160
-    lr = 4e-5
+    lr = 1e-4
     clip_epsilon = 0.08
     ppo_epochs = 3
     compile_model = True

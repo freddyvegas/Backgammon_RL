@@ -68,7 +68,7 @@ class Config:
     resid_dropout = 0.1
 
     # PPO hyperparameters (gentler for stability)
-    lr = 1e-4
+    lr = 5e-5
     gamma = 0.99
     gae_lambda = 0.95
     clip_epsilon = 0.1
@@ -91,7 +91,7 @@ class Config:
     max_grad_norm = 0.5
 
     # Weight decay
-    weight_decay = 1e-5
+    weight_decay = 1e-6
 
     # Reward scaling
     reward_scale = 1.0
