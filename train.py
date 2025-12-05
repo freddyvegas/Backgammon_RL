@@ -80,6 +80,7 @@ class TrainingState:
     algo: str                 # "ppo" or "micro-a2c"
     model_size: str
     device: str
+    teacher: str
     eval_vs: str
     n_games: int
     n_epochs: int
@@ -167,7 +168,8 @@ def initialize_training(
     device='cpu',
     agent_type='MLP',
     resume=None,
-    batch_size=8
+    batch_size=8,
+    teacher='pubeval'
 ) -> TrainingState:
 
     algo = algo.lower()
@@ -188,6 +190,20 @@ def initialize_training(
     print(f"Device: {device}")
     if algo == "ppo":
         print(f"Agent type: {agent_type}")
+    teacher_module = None
+    teacher = (teacher or 'pubeval').lower()
+    if algo == 'ppo':
+        if teacher == 'pubeval':
+            teacher_module = pubeval
+        elif teacher == 'gnubg':
+            teacher_module = gnubg_player
+        elif teacher in ('none', 'off', 'disabled'):
+            teacher = 'none'
+        else:
+            raise ValueError(f"Unsupported teacher '{teacher}'. Use 'pubeval', 'gnubg', or 'none'.")
+        print(f"Teacher: {teacher}")
+    else:
+        teacher = 'none'
     print(f"Batch size: {batch_size}")
     print("=" * 70 + "\n")
 
@@ -198,11 +214,17 @@ def initialize_training(
             agent_instance = transformer_agent.PPOAgent(
                 config=cfg,
                 device=device,
-                pubeval_module=pubeval
+                teacher_mode=teacher,
+                teacher_module=teacher_module
             )
         else:
             cfg = ppo_agent.get_config(model_size)
-            agent_instance = ppo_agent.PPOAgent(config=cfg, device=device, pubeval_module=pubeval)
+            agent_instance = ppo_agent.PPOAgent(
+                config=cfg,
+                device=device,
+                teacher_mode=teacher,
+                teacher_module=teacher_module
+            )
     elif algo == "baseline-td":  # NEW: Add baseline option
         import agent_td_lambda_baseline as baseline_agent
         cfg = baseline_agent.get_config(model_size)
@@ -296,6 +318,7 @@ def initialize_training(
         algo=algo,
         model_size=model_size,
         device=device,
+        teacher=teacher,
         eval_vs=eval_vs,
         n_games=n_games,
         n_epochs=n_epochs,
@@ -346,6 +369,8 @@ def initialize_training(
         print(f"  Snapshot frequency: every {state.pool_snapshot_every:,} games")
     print(f"Evaluation: every {state.n_epochs:,} games")
     print(f"Total games: {state.n_games:,}")
+    if state.algo == 'ppo':
+        print(f"Teacher: {state.teacher}")
     print(f"Batch size: {state.batch_size}")
     print(f"{'='*60}\n")
 
@@ -692,7 +717,8 @@ def train(
     device='cpu',
     agent_type='MLP',
     resume=None,
-    batch_size=8
+    batch_size=8,
+    teacher='pubeval'
 ):
     # Initialize
     state = initialize_training(
@@ -707,7 +733,8 @@ def train(
         use_eval_lookahead=use_eval_lookahead,
         eval_lookahead_k=eval_lookahead_k, use_bc_warmstart=use_bc_warmstart,
         league_checkpoint_every=league_checkpoint_every, n_eval_league=n_eval_league,
-        device=device, agent_type=agent_type, resume=resume, batch_size=batch_size
+        device=device, agent_type=agent_type, resume=resume, batch_size=batch_size,
+        teacher=teacher
     )
 
     # Validate initial model
@@ -817,6 +844,9 @@ if __name__ == "__main__":
                         help='PPO agent type: MLP or transformer')
     parser.add_argument('--resume', type=Path, default=None,
                         help='Path to a .pt checkpoint to resume training from')
+    parser.add_argument('--teacher', type=str, default='pubeval',
+                        choices=['pubeval', 'gnubg', 'none'],
+                        help='Teacher used for PPO DAGGER supervision')
     args = parser.parse_args()
 
     # CPU test mode: fast settings for debugging
@@ -852,7 +882,8 @@ if __name__ == "__main__":
             device=args.device,
             agent_type=args.agent_type,
             batch_size=args.batch_size,
-            resume=args.resume
+            resume=args.resume,
+            teacher=args.teacher
         )
     else:
         train(
@@ -874,5 +905,6 @@ if __name__ == "__main__":
             device=args.device,
             agent_type=args.agent_type,
             resume=args.resume,
-            batch_size=args.batch_size
+            batch_size=args.batch_size,
+            teacher=args.teacher
         )

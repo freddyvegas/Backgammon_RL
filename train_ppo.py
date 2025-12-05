@@ -57,6 +57,7 @@ class TrainingState:
     # Config / static
     model_size: str
     device: str
+    teacher: str
     eval_vs: str
     n_games: int
     n_epochs: int
@@ -135,7 +136,8 @@ def initialize_training(
     device='cpu',
     agent_type='MLP',
     resume=None,
-    batch_size=8
+    batch_size=8,
+    teacher='pubeval'
 ) -> TrainingState:
     print("\n" + "=" * 70)
     print("PPO TRAINING")
@@ -149,17 +151,35 @@ def initialize_training(
     print(f"Device: {device}")
     print("=" * 70 + "\n")
 
+    teacher = (teacher or 'pubeval').lower()
+    if teacher == 'pubeval':
+        teacher_module = pubeval
+    elif teacher == 'gnubg':
+        teacher_module = gnubg_player
+    elif teacher in ('none', 'off', 'disabled'):
+        teacher_module = None
+        teacher = 'none'
+    else:
+        raise ValueError(f"Unsupported teacher '{teacher}'")
+    print(f"Teacher: {teacher}")
+
     # Agent + gentle curriculum tweaks
     if agent_type ==  'transformer':
         cfg = transformer_agent.get_config(model_size)
         agent_instance = transformer_agent.PPOAgent(
             config=cfg,
             device=device,
-            pubeval_module=pubeval
+            teacher_mode=teacher,
+            teacher_module=teacher_module
         )
     else:
         cfg = agent.get_config(model_size)
-        agent_instance = agent.PPOAgent(config=cfg, device=device, pubeval_module=pubeval)
+        agent_instance = agent.PPOAgent(
+            config=cfg,
+            device=device,
+            teacher_mode=teacher,
+            teacher_module=teacher_module
+        )
 
 
     if resume is not None:
@@ -221,7 +241,7 @@ def initialize_training(
 
     state = TrainingState(
         # Static / config
-        model_size=model_size, device=device, eval_vs=eval_vs,
+        model_size=model_size, device=device, teacher=teacher, eval_vs=eval_vs,
         n_games=n_games, n_epochs=n_epochs, n_eval=n_eval, batch_size=batch_size,
         start_step=start_step, use_opponent_pool=use_opponent_pool,
         pool_snapshot_every=pool_snapshot_every,
@@ -472,7 +492,8 @@ def train(
     device='cpu',
     agent_type='MLP',
     resume=None,
-    batch_size=8
+    batch_size=8,
+    teacher='pubeval'
 ):
     # Initialize
     state = initialize_training(
@@ -483,7 +504,8 @@ def train(
         random_sample_rate=random_sample_rate, use_eval_lookahead=use_eval_lookahead,
         eval_lookahead_k=eval_lookahead_k, use_bc_warmstart=use_bc_warmstart,
         league_checkpoint_every=league_checkpoint_every, n_eval_league=n_eval_league,
-        device=device, agent_type=agent_type, resume=resume, batch_size=batch_size
+        device=device, agent_type=agent_type, resume=resume, batch_size=batch_size,
+        teacher=teacher
     )
 
     # Validate initial model
@@ -558,6 +580,9 @@ if __name__ == "__main__":
                         help='Agent type to train')
     parser.add_argument('--resume', type=Path, default=None,
                         help='Path to a .pt checkpoint to resume training from')
+    parser.add_argument('--teacher', type=str, default='pubeval',
+                        choices=['pubeval', 'gnubg', 'none'],
+                        help='Teacher used for DAGGER supervision (PPO only)')
     args = parser.parse_args()
 
     # CPU test mode: fast settings for testing
@@ -588,6 +613,7 @@ if __name__ == "__main__":
             use_bc_warmstart=False,  # Jump-start with pubeval imitation
             league_checkpoint_every=10_000,
             device='cpu',
+            teacher=args.teacher,
         )
     else:
         train(
@@ -607,5 +633,6 @@ if __name__ == "__main__":
             device = args.device,
             agent_type = args.agent_type,
             resume = args.resume,
-            batch_size = args.batch_size
+            batch_size = args.batch_size,
+            teacher=args.teacher
         )

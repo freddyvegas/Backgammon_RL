@@ -102,8 +102,10 @@ def play_games_batched(agent_obj, opponent, batch_size=8, training=True):
                 mask = np.zeros(agent_obj.config.max_actions, dtype=np.float32)
 
                 nA = min(len(pboards), agent_obj.config.max_actions)
+                pmoves_cur = pmoves[:nA]
+                pboards_cur = pboards[:nA]
                 for a in range(nA):
-                    after29 = flip_to_pov_plus1(pboards[a], 1)
+                    after29 = flip_to_pov_plus1(pboards_cur[a], 1)
                     nSecondRoll_next = (passes_left[idx] - 1) > 1
                     cand_feats[a]  = one_hot_encoding(after29, nSecondRoll_next)
                     raw_after_states.append(after29.astype(np.float32))
@@ -113,7 +115,9 @@ def play_games_batched(agent_obj, opponent, batch_size=8, training=True):
                 batch_cand_states.append(cand_feats)
                 batch_masks.append(mask)
                 after_states_np = np.stack(raw_after_states, axis=0) if raw_after_states else np.zeros((0, 29), dtype=np.float32)
-                per_env_candidates.append((idx, pmoves, pboards, board_pov, after_states_np))
+                board_snapshot = board.copy()
+                dice_snapshot = np.array(dice, dtype=np.int32)
+                per_env_candidates.append((idx, pmoves_cur, pboards_cur, board_pov, after_states_np, board_snapshot, dice_snapshot))
 
             # Batched forward pass for agent
             states_np = np.stack(batch_states, axis=0)
@@ -136,7 +140,7 @@ def play_games_batched(agent_obj, opponent, batch_size=8, training=True):
                 log_probs = [0.0] * len(a_idxs)
 
             # Apply agent actions
-            for row, (idx, pmoves, pboards, board_pov, raw_after_states) in enumerate(per_env_candidates):
+            for row, (idx, pmoves, pboards, board_pov, raw_after_states, board_snapshot, dice_snapshot) in enumerate(per_env_candidates):
                 a_idx = int(a_idxs[row])
                 if a_idx >= len(pmoves):
                     a_idx = len(pmoves) - 1
@@ -174,10 +178,18 @@ def play_games_batched(agent_obj, opponent, batch_size=8, training=True):
                     value = values[row].item() if hasattr(values[row], 'item') else float(values[row])
 
                     teacher_idx = -1
-                    if (agent_obj.pubeval is not None and
-                        random.random() < agent_obj.config.teacher_sample_rate):
-                        teacher_idx = agent_obj._get_teacher_label(
-                            board_pov, raw_after_states, mask_for_this
+                    if (
+                        agent_obj.has_teacher() and
+                        random.random() < agent_obj.config.teacher_sample_rate
+                    ):
+                        teacher_idx = agent_obj.compute_teacher_index(
+                            board_abs=board_snapshot,
+                            dice=dice_snapshot,
+                            player=1,
+                            board_pov=board_pov,
+                            after_states_pov=raw_after_states,
+                            pmoves=pmoves,
+                            mask=mask_for_this
                         )
 
                     # Push transition to buffer
@@ -455,9 +467,11 @@ def play_games_batched_transformer(agent_obj, opponent, batch_size=8, training=T
                 raw_after_states = []
 
                 nA = min(len(pboards), Amax)
+                pmoves_cur = pmoves[:nA]
+                pboards_cur = pboards[:nA]
                 nSecondRoll_next = ((passes_left[idx] - 1) > 1)
                 for a in range(nA):
-                    after29 = flip_to_pov_plus1(pboards[a], 1).astype(np.float32)
+                    after29 = flip_to_pov_plus1(pboards_cur[a], 1).astype(np.float32)
                     cand_feats[a] = transformer_one_hot_encoding(after29, nSecondRoll_next, actor_flag=1.0)
                     raw_after_states.append(after29)
                     mask[a] = 1.0
@@ -466,7 +480,9 @@ def play_games_batched_transformer(agent_obj, opponent, batch_size=8, training=T
                 batch_cand_states.append(cand_feats)
                 batch_masks.append(mask)
                 after_np = np.stack(raw_after_states, axis=0) if raw_after_states else np.zeros((0, 29), dtype=np.float32)
-                per_env_candidates.append((idx, pmoves, pboards, board_pov, after_np))
+                board_snapshot = board.copy()
+                dice_snapshot = np.array(dice, dtype=np.int32)
+                per_env_candidates.append((idx, pmoves_cur, pboards_cur, board_pov, after_np, board_snapshot, dice_snapshot))
 
                 seq_pad, seq_len = pad_truncate_seq(
                     histories293[idx], N, D, start_token_np, history_has_start[idx]
@@ -508,7 +524,7 @@ def play_games_batched_transformer(agent_obj, opponent, batch_size=8, training=T
                 log_probs = [0.0] * len(a_idxs)
 
             # Apply actions and record transitions
-            for row, (idx, pmoves, pboards, board_pov, raw_after_states) in enumerate(per_env_candidates):
+            for row, (idx, pmoves, pboards, board_pov, raw_after_states, board_snapshot, dice_snapshot) in enumerate(per_env_candidates):
                 a_idx = int(a_idxs[row])
                 if a_idx >= len(pmoves):  # clamp against padding
                     a_idx = len(pmoves) - 1
@@ -544,9 +560,19 @@ def play_games_batched_transformer(agent_obj, opponent, batch_size=8, training=T
                     cand_np = batch_cand_states[row]
                     mask_np = batch_masks[row]
                     teacher_idx = -1
-                    if (agent_obj.pubeval is not None and
-                        random.random() < agent_obj.config.teacher_sample_rate):
-                        teacher_idx = agent_obj._get_teacher_label(board_pov, raw_after_states, mask_np)
+                    if (
+                        agent_obj.has_teacher() and
+                        random.random() < agent_obj.config.teacher_sample_rate
+                    ):
+                        teacher_idx = agent_obj.compute_teacher_index(
+                            board_abs=board_snapshot,
+                            dice=dice_snapshot,
+                            player=1,
+                            board_pov=board_pov,
+                            after_states_pov=raw_after_states,
+                            pmoves=pmoves,
+                            mask=mask_np
+                        )
                     per_env_rollouts[idx].append((
                         seq_padded_np, int(seq_len),
                         cand_np, mask_np,

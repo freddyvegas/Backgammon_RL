@@ -362,16 +362,23 @@ class PPOActorCritic(nn.Module):
 class PPOAgent:
     """PPO agent with teacher signal support (DAGGER-lite)."""
 
-    def __init__(self, config=None, device=None, pubeval_module=None):
+    def __init__(self, config=None, device=None,
+                 teacher_mode: str = 'pubeval', teacher_module=None):
         """
         Args:
             config: Config object
             device: Device string or None for auto-detect
-            pubeval_module: Module with pubeval functions for teacher signal
+            teacher_mode: 'pubeval', 'gnubg', or 'none'
+            teacher_module: backing module implementing the teacher
         """
         self.config = config or CFG
         self.device = device or get_device()
-        self.pubeval = pubeval_module  # NEW: store pubeval module
+        mode = (teacher_mode or 'none').lower()
+        if mode not in ('pubeval', 'gnubg', 'none'):
+            print(f"Unknown teacher '{teacher_mode}', defaulting to 'none'.")
+            mode = 'none'
+        self.teacher_type = mode
+        self.teacher_module = teacher_module if mode != 'none' else None
 
         # FIX #1: Network created with correct keyword argument names
         self.acnet = PPOActorCritic(
@@ -423,6 +430,7 @@ class PPOAgent:
             'nA_values': [],
         }
 
+        teacher_label = self.teacher_type if self.teacher_module is not None else 'disabled'
         print(f"PPOAgent initialized with IMPROVED hyperparameters:")
         print(f"  Device: {self.device}")
         print(f"  LR: {self.config.lr} (gentler)")
@@ -430,8 +438,19 @@ class PPOAgent:
         print(f"  PPO epochs: {self.config.ppo_epochs} (gentler)")
         print(f"  Max grad norm: {self.config.max_grad_norm}")
         print(f"  Teacher signal: {self.config.teacher_sample_rate*100:.0f}% sample rate")
+        print(f"  Teacher source: {teacher_label}")
         if self.lr_scheduler is not None:
             print(f"  LR schedule active (warmup={self.config.lr_warmup_updates}, cosine={self.config.lr_cosine_updates})")
+
+    def _teacher_enabled(self) -> bool:
+        return (
+            self.teacher_module is not None and
+            self.teacher_type != 'none' and
+            self.config.teacher_sample_rate > 0
+        )
+
+    def has_teacher(self) -> bool:
+        return self._teacher_enabled()
 
     def _build_lr_lambda(self):
         """Warmup + cosine decay schedule for PPO updates."""
@@ -574,9 +593,8 @@ class PPOAgent:
         returns = advantages + values
         return advantages, returns
 
-    def _get_teacher_label(self, state29, after_states29, mask):
-        """Return pubeval argmax for the provided candidate after-states."""
-        if self.pubeval is None:
+    def _get_teacher_label_pubeval(self, state29, after_states29, mask):
+        if self.teacher_type != 'pubeval' or self.teacher_module is None:
             return -1
 
         try:
@@ -588,14 +606,56 @@ class PPOAgent:
             scores = []
             for k in range(nA):
                 after = cand[k]
-                race = int(self.pubeval.israce(after))
-                pb28 = self.pubeval.pubeval_flip(after)
-                pos = self.pubeval._to_int32_view(pb28)
-                scores.append(float(self.pubeval._pubeval_scalar(race, pos)))
+                race = int(self.teacher_module.israce(after))
+                pb28 = self.teacher_module.pubeval_flip(after)
+                pos = self.teacher_module._to_int32_view(pb28)
+                scores.append(float(self.teacher_module._pubeval_scalar(race, pos)))
 
             return int(np.argmax(scores))
         except Exception:
             return -1
+
+    def _get_teacher_label_gnubg(self, board_abs, dice, player, pmoves):
+        if self.teacher_type != 'gnubg' or self.teacher_module is None:
+            return -1
+        try:
+            move = self.teacher_module.action(board_abs.copy(), np.array(dice, dtype=np.int32), player, 0)
+        except Exception:
+            return -1
+
+        if move is None or len(move) == 0:
+            return -1
+
+        move_arr = np.asarray(move)
+        if move_arr.ndim == 1:
+            move_arr = move_arr.reshape(1, 2)
+
+        for idx, cand in enumerate(pmoves):
+            cand_arr = np.asarray(cand)
+            if cand_arr.shape == move_arr.shape and np.array_equal(cand_arr, move_arr):
+                return idx
+        return -1
+
+    def compute_teacher_index(self, board_abs, dice, player, board_pov, after_states_pov, pmoves, mask):
+        if not self._teacher_enabled():
+            return -1
+        if self.teacher_type == 'pubeval':
+            if board_pov is None or after_states_pov is None or mask is None:
+                return -1
+            mask = np.asarray(mask, dtype=np.float32)
+            mask = mask[:after_states_pov.shape[0]]
+            idx = self._get_teacher_label_pubeval(board_pov, after_states_pov, mask)
+            if idx < 0 or idx >= mask.shape[0] or mask[idx] <= 0:
+                return -1
+            return idx
+        if self.teacher_type == 'gnubg':
+            idx = self._get_teacher_label_gnubg(board_abs, dice, player, pmoves)
+            if mask is not None:
+                mask_np = np.asarray(mask, dtype=np.float32)
+                if idx < 0 or idx >= mask_np.shape[0] or mask_np[idx] <= 0:
+                    return -1
+            return idx
+        return -1
 
     def warmstart_with_pubeval(
         self,
@@ -626,6 +686,10 @@ class PPOAgent:
         grad_clip : float
             Global grad-norm clipping.
         """
+        if self.teacher_type != 'pubeval' or self.teacher_module is None:
+            print("Warmstart skipped: requires pubeval teacher.")
+            return
+
         import torch
         import torch.nn.functional as F
 
@@ -637,7 +701,7 @@ class PPOAgent:
             for S29, C29, M in batch_iter:
                 # -------- teacher labels on 29-dim boards --------
                 labels = np.array(
-                    [self._get_teacher_label(S29[i], C29[i], M[i]) for i in range(S29.shape[0])],
+                    [self._get_teacher_label_pubeval(S29[i], C29[i], M[i]) for i in range(S29.shape[0])],
                     dtype=np.int64
                 )
 
@@ -775,11 +839,12 @@ class PPOAgent:
                 entropy = -(probs * log_probs_all).sum(dim=-1).mean()
 
                 # Teacher loss (DAGGER-lite) - NEW!
-                has_teacher = (mb_teacher_idx >= 0)
-                if has_teacher.any():
-                    # CE loss for teacher labels
-                    teacher_log_probs = log_probs_all.gather(1, mb_teacher_idx.clamp(min=0).unsqueeze(1)).squeeze(1)
-                    teacher_loss = -teacher_log_probs[has_teacher].mean()
+                max_actions = mb_masks.size(1)
+                valid_teacher = (mb_teacher_idx >= 0) & (mb_teacher_idx < max_actions)
+                if valid_teacher.any():
+                    safe_idx = mb_teacher_idx.clamp(0, max_actions - 1)
+                    teacher_log_probs = log_probs_all.gather(1, safe_idx.unsqueeze(1)).squeeze(1)
+                    teacher_loss = -teacher_log_probs[valid_teacher].mean()
                 else:
                     teacher_loss = torch.tensor(0.0, device=self.device)
 
@@ -878,7 +943,7 @@ class PPOAgent:
                     value_single = (value_sa.squeeze(-1)[0].item() if value_sa.dim() > 1 else value_sa[0].item())
 
                 teacher_idx = -1
-                if (self.pubeval is not None and
+                if (self._teacher_enabled() and
                     random.random() < self.config.teacher_sample_rate):
                     teacher_idx = 0
 
@@ -950,9 +1015,17 @@ class PPOAgent:
 
         # Get teacher label (NEW!)
         teacher_idx = -1
-        if (train and not self.eval_mode and self.pubeval is not None and
+        if (train and not self.eval_mode and self._teacher_enabled() and
             random.random() < self.config.teacher_sample_rate):
-            teacher_idx = self._get_teacher_label(board_pov, after_boards, mask)
+            teacher_idx = self.compute_teacher_index(
+                board_abs=board_copy,
+                dice=dice,
+                player=player,
+                board_pov=board_pov,
+                after_states_pov=after_boards,
+                pmoves=possible_moves,
+                mask=mask
+            )
 
         # Store in buffer
         if train and not self.eval_mode:
@@ -1004,7 +1077,13 @@ def _get_agent():
             pubeval = None
             print("Warning: Could not import pubeval, teacher signal disabled")
 
-        _default_agent = PPOAgent(config=CFG, device=device, pubeval_module=pubeval)
+        teacher_mode = 'pubeval' if pubeval is not None else 'none'
+        _default_agent = PPOAgent(
+            config=CFG,
+            device=device,
+            teacher_mode=teacher_mode,
+            teacher_module=pubeval
+        )
         print(f"PPO agent initialized with improved hyperparameters")
     return _default_agent
 
