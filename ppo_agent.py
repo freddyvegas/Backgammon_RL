@@ -38,7 +38,7 @@ class Config:
     max_actions = 64
 
     # PPO hyperparameters - GENTLER for stability
-    lr = 1e-4              # Reduced from 1e-4 → 5e-5
+    lr = 5e-5              # Gentler default
     gamma = 0.99
     gae_lambda = 0.95
     clip_epsilon = 0.1     # Reduced from 0.2 → 0.1
@@ -70,7 +70,7 @@ class Config:
     max_grad_norm = 0.5
 
     # Weight decay
-    weight_decay = 1e-5
+    weight_decay = 1e-6
 
     # Reward scaling
     reward_scale = 1.0
@@ -89,9 +89,8 @@ class Config:
     teacher_decay_horizon = 50_000  # Decay over this many games
 
     # Learning-rate schedule (warmup + cosine decay)
-    lr_warmup_updates = 100
-    lr_cosine_updates = 3000
-    lr_min_ratio = 0.2
+    lr_warmup_ratio = 0.1
+    lr_min_ratio = 0.1
 
 
 class SmallConfig(Config):
@@ -106,8 +105,6 @@ class SmallConfig(Config):
     ppo_epochs = 2  # Gentler
     clip_epsilon = 0.1  # Gentler
     use_reward_shaping = False
-    lr_warmup_updates = 50
-    lr_cosine_updates = 2000
 
 
 class MediumConfig(Config):
@@ -129,9 +126,9 @@ class LargeConfig(Config):
     value_hidden_mult = 1.0
     rollout_length = 640
     minibatch_size = 160
-    lr = 1e-4
-    clip_epsilon = 0.08
-    ppo_epochs = 3
+    lr = 5e-5
+    clip_epsilon = 0.1
+    ppo_epochs = 2
     compile_model = True
 
 
@@ -157,7 +154,8 @@ def get_config(size='large'):
     print(f"  PPO clip ε: {cfg.clip_epsilon} (gentler)")
     print(f"  PPO epochs: {cfg.ppo_epochs} (gentler)")
     print(f"  Teacher signal: {cfg.teacher_sample_rate*100:.0f}% sample rate")
-    print(f"  LR schedule: warmup={cfg.lr_warmup_updates}, cosine={cfg.lr_cosine_updates}, min_ratio={cfg.lr_min_ratio}")
+    warmup = getattr(cfg, 'lr_warmup_ratio', None)
+    print(f"  LR schedule: warmup_ratio={warmup}, min_ratio={cfg.lr_min_ratio}")
 
     return cfg
 
@@ -403,12 +401,8 @@ class PPOAgent:
             lr=self.config.lr,
             weight_decay=self.config.weight_decay
         )
-        self.lr_scheduler = None
-        if getattr(self.config, "lr_warmup_updates", 0) > 0 or getattr(self.config, "lr_cosine_updates", 0) > 0:
-            self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
-                self.optimizer,
-                lr_lambda=self._build_lr_lambda()
-            )
+        self._base_lrs = [group['lr'] for group in self.optimizer.param_groups]
+        self.training_horizon = None
 
         # Rollout buffer
         self.buffer = PPORolloutBuffer(rollout_length=self.config.rollout_length)
@@ -439,8 +433,6 @@ class PPOAgent:
         print(f"  Max grad norm: {self.config.max_grad_norm}")
         print(f"  Teacher signal: {self.config.teacher_sample_rate*100:.0f}% sample rate")
         print(f"  Teacher source: {teacher_label}")
-        if self.lr_scheduler is not None:
-            print(f"  LR schedule active (warmup={self.config.lr_warmup_updates}, cosine={self.config.lr_cosine_updates})")
 
     def _teacher_enabled(self) -> bool:
         return (
@@ -452,22 +444,31 @@ class PPOAgent:
     def has_teacher(self) -> bool:
         return self._teacher_enabled()
 
-    def _build_lr_lambda(self):
-        """Warmup + cosine decay schedule for PPO updates."""
-        warmup = max(0, int(getattr(self.config, "lr_warmup_updates", 0)))
-        cosine = max(0, int(getattr(self.config, "lr_cosine_updates", 0)))
-        min_ratio = float(getattr(self.config, "lr_min_ratio", 0.2))
+    def _lr_scale(self, game_count: int) -> float:
+        horizon = float(self.training_horizon or 1)
+        progress = min(max(game_count / horizon, 0.0), 1.0)
+        warmup = float(getattr(self.config, 'lr_warmup_ratio', 0.1))
+        if warmup > 0 and progress < warmup:
+            return max(1e-3, progress / warmup)
+        if warmup > 0:
+            progress = (progress - warmup) / max(1e-9, 1.0 - warmup)
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return max(self.config.lr_min_ratio, cosine)
 
-        def lr_lambda(update_idx: int):
-            if warmup > 0 and update_idx < warmup:
-                return max(1e-3, float(update_idx + 1) / float(warmup))
-            if cosine > 0:
-                progress = min(1.0, max(0.0, (update_idx - warmup) / max(1, float(cosine))))
-                cosine_factor = 0.5 * (1.0 + math.cos(math.pi * progress))
-                return max(min_ratio, cosine_factor)
-            return 1.0
+    def set_training_horizon(self, total_games: int):
+        if total_games is None:
+            return
+        self.training_horizon = max(1, int(total_games))
+        self.update_lr_schedule(0)
 
-        return lr_lambda
+    def update_lr_schedule(self, games_done: int, total_games: int = None):
+        if total_games is not None:
+            self.set_training_horizon(total_games)
+        if not self._base_lrs:
+            return
+        scale = self._lr_scale(int(max(0, games_done)))
+        for lr, group in zip(self._base_lrs, self.optimizer.param_groups):
+            group['lr'] = lr * scale
 
     def _encode_state(self, board29, moves_left=0):
         """Return 293-dim one-hot features (net input)."""
@@ -882,8 +883,6 @@ class PPOAgent:
         )
 
         self.updates += 1
-        if self.lr_scheduler is not None:
-            self.lr_scheduler.step()
 
         # Print update info periodically
         if self.updates % 10 == 0:
@@ -895,9 +894,8 @@ class PPOAgent:
             print(f"  Teacher loss: {total_teacher_loss / n_updates:.4f} (α={alpha:.4f})")
             print(f"  Grad norm: {grad_norm:.4f}")
             print(f"  Entropy coef: {self.current_entropy_coef:.6f}")
-            if self.lr_scheduler is not None:
-                current_lr = self.optimizer.param_groups[0]["lr"]
-                print(f"  LR (scheduled): {current_lr:.6e}")
+            current_lr = self.optimizer.param_groups[0]["lr"]
+            print(f"  LR (scheduled): {current_lr:.6e}")
             print(f"  Samples/update: {samples_per_update} | Total samples: {self.steps}")
 
         # Clear buffer

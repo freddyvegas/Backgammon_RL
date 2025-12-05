@@ -72,6 +72,10 @@ class Config:
     gamma = 0.99
     gae_lambda = 0.95
     clip_epsilon = 0.1
+    # Learning-rate schedule (legacy params kept for parity with PPO MLP agent)
+    lr_warmup_updates = 100
+    lr_cosine_updates = 3000
+    lr_min_ratio = 0.1
 
     # Exploration
     entropy_coef = 0.02
@@ -146,7 +150,7 @@ class LargeConfig(Config):
     max_seq_len = 64
     rollout_length = 640
     minibatch_size = 160
-    ppo_epochs = 3
+    ppo_epochs = 2
     compile_model = True
 
 
@@ -446,6 +450,8 @@ class PPOAgent:
         self.optimizer = torch.optim.AdamW(
             self.acnet.parameters(), lr=self.config.lr, weight_decay=self.config.weight_decay
         )
+        self._base_lrs = [group['lr'] for group in self.optimizer.param_groups]
+        self.training_horizon = None
 
         self.buffer = PPORolloutBuffer(rollout_length=self.config.rollout_length)
 
@@ -477,6 +483,32 @@ class PPOAgent:
         print(f"  Max seq: {self.config.max_seq_len}, BOS={self.config.use_bos_token}")
         teacher_label = self.teacher_type if self.teacher_module is not None else 'disabled'
         print(f"  Teacher source: {teacher_label}")
+
+    def _lr_scale(self, game_count: int) -> float:
+        horizon = float(self.training_horizon or 1)
+        progress = min(max(game_count / horizon, 0.0), 1.0)
+        warmup = float(getattr(self.config, 'lr_warmup_ratio', 0.1))
+        if warmup > 0 and progress < warmup:
+            return max(1e-3, progress / warmup)
+        if warmup > 0:
+            progress = (progress - warmup) / max(1e-9, 1.0 - warmup)
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return max(self.config.lr_min_ratio, cosine)
+
+    def set_training_horizon(self, total_games: int):
+        if total_games is None:
+            return
+        self.training_horizon = max(1, int(total_games))
+        self.update_lr_schedule(0)
+
+    def update_lr_schedule(self, games_done: int, total_games: int = None):
+        if total_games is not None:
+            self.set_training_horizon(total_games)
+        if not self._base_lrs:
+            return
+        scale = self._lr_scale(int(max(0, games_done)))
+        for lr, group in zip(self._base_lrs, self.optimizer.param_groups):
+            group['lr'] = lr * scale
 
     def _teacher_enabled(self) -> bool:
         return (

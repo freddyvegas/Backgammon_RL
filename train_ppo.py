@@ -180,6 +180,8 @@ def initialize_training(
             teacher_mode=teacher,
             teacher_module=teacher_module
         )
+    if hasattr(agent_instance, 'set_training_horizon'):
+        agent_instance.set_training_horizon(n_games)
 
 
     if resume is not None:
@@ -351,6 +353,8 @@ def train_step(state: TrainingState, train_bar: tqdm):
 
     # Accounting
     state.games_done += finished
+    if hasattr(ai, 'update_lr_schedule'):
+        ai.update_lr_schedule(state.games_done)
     train_bar.update(finished)
     state.opponent_stats[opponent_type] += finished
 

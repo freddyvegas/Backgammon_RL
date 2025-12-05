@@ -225,6 +225,8 @@ def initialize_training(
                 teacher_mode=teacher,
                 teacher_module=teacher_module
             )
+        if hasattr(agent_instance, 'set_training_horizon'):
+            agent_instance.set_training_horizon(n_games)
     elif algo == "baseline-td":  # NEW: Add baseline option
         import agent_td_lambda_baseline as baseline_agent
         cfg = baseline_agent.get_config(model_size)
@@ -523,6 +525,8 @@ def train_step(state: TrainingState, train_bar: tqdm):
 
     # Accounting
     state.games_done += total_finished
+    if hasattr(ai, 'update_lr_schedule') and state.algo == 'ppo':
+        ai.update_lr_schedule(state.games_done)
     train_bar.update(total_finished)
     state.opponent_stats[opponent_type] += finished
     if slow_finished:
