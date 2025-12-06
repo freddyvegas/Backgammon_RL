@@ -72,9 +72,6 @@ class Config:
     gamma = 0.99
     gae_lambda = 0.95
     clip_epsilon = 0.1
-    # Learning-rate schedule (legacy params kept for parity with PPO MLP agent)
-    lr_warmup_updates = 100
-    lr_cosine_updates = 3000
     lr_min_ratio = 0.1
 
     # Exploration
@@ -91,11 +88,10 @@ class Config:
     minibatch_size = 128
 
     # Gradient clipping
-    grad_clip = 0.5
     max_grad_norm = 0.5
 
     # Weight decay
-    weight_decay = 1e-6
+    weight_decay = 1e-5
 
     # Reward scaling
     reward_scale = 1.0
@@ -253,11 +249,15 @@ class TransformerBlock(nn.Module):
             nn.Dropout(resid_dropout),
         )
 
-    def forward(self, x, attn_mask):
+    def forward(self, x, attn_mask, key_padding_mask=None):
         # x: (B, L, d)
         h = self.ln1(x)
         # attn_mask: (L, L) with True for disallowed positions (causal)
-        attn_out, _ = self.attn(h, h, h, attn_mask=attn_mask)
+        attn_out, _ = self.attn(
+            h, h, h,
+            attn_mask=attn_mask,
+            key_padding_mask=key_padding_mask
+        )
         x = x + attn_out
         x = x + self.mlp(self.ln2(x))
         return x
@@ -353,18 +353,30 @@ class TransformerActorCritic(nn.Module):
             bos = self.bos.expand(B, 1, -1)
             x = torch.cat([bos, x], dim=1)  # (B, 1+L, d)
             pos = self.pos_emb[:, : (L + 1), :]
-            last_idx = seq_lens + 0  # last token index shifts by 1 for BOS? We want last=seq_lens (index of last real token)
+            # last real token index (0-based) in x:
+            last_idx = seq_lens.clamp(min=0)  # 0..L, BOS at 0
         else:
             pos = self.pos_emb[:, : L, :]
-            last_idx = seq_lens - 1
+            last_idx = (seq_lens - 1).clamp(min=0)
 
         x = x + pos
-
         Lp = x.size(1)
-        attn_mask = self._causal_mask(Lp, device)
+
+        causal_mask = self._causal_mask(Lp, device)     # (Lp, Lp) bool
+
+        # key_padding_mask: True = position to ignore
+        if self.use_bos_token:
+            # BOS is always valid, padding starts after 1 = seq_len
+            pad = torch.arange(Lp, device=device).unsqueeze(0)  # (1, Lp)
+            # valid posistion: 0..seq_len (inclusive, BOS + tokens)
+            valid_len = (seq_lens + 1).unsqueeze(1)     # (B, 1)
+        else:
+            pad = torch.arange(Lp, device=device).unsqueeze(0)
+            valid_len = seq_lens.unsqueeze(1)
+        key_padding_mask = pad >= valid_len     # (B, Lp)
 
         for blk in self.blocks:
-            x = blk(x, attn_mask)
+            x = blk(x, causal_mask, key_padding_mask)
 
         x = self.ln_f(x)
         return x, last_idx
@@ -473,7 +485,6 @@ class PPOAgent:
             'teacher_loss': [],
             'masked_entropy': [],
             'grad_norm': [],
-            'nA_values': [],
         }
 
         print("Transformer PPOAgent initialized:")
@@ -1198,7 +1209,11 @@ class PPOAgent:
 
                 logits, _ = self.acnet(St, Lt, Ct, Mt)
                 logits = logits.masked_fill(Mt == 0, -1e9)
-                y = torch.as_tensor(labels, dtype=torch.long, device=self.device)
+                valid = labels >= 0
+                if valid.sum() == 0:
+                    continue
+                logits_valid = logits[valid]
+                y_valid = torch.as_tensor(labels[valid], dtype=torch.long, device=self.device)
                 loss = ce(logits, y)
 
                 opt.zero_grad(set_to_none=True)

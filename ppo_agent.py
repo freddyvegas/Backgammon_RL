@@ -70,7 +70,7 @@ class Config:
     max_grad_norm = 0.5
 
     # Weight decay
-    weight_decay = 1e-6
+    weight_decay = 1e-5
 
     # Reward scaling
     reward_scale = 1.0
@@ -89,7 +89,7 @@ class Config:
     teacher_decay_horizon = 50_000  # Decay over this many games
 
     # Learning-rate schedule (warmup + cosine decay)
-    lr_warmup_ratio = 0.1
+    lr_warmup_ratio = 0.01
     lr_min_ratio = 0.1
 
 
