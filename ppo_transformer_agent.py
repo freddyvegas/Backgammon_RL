@@ -1,5 +1,6 @@
 from pathlib import Path
 from typing import Union, List, Optional, Tuple
+from contextlib import nullcontext
 import numpy as np
 import torch
 import torch.nn as nn
@@ -109,7 +110,8 @@ class Config:
     teacher_decay_horizon = 50_000
 
     # Compilation / performance knobs
-    compile_model = False
+    compile_model = True
+    use_amp = True
 
 
 class SmallConfig(Config):
@@ -235,12 +237,26 @@ class PPORolloutBuffer:
 
 
 # ------------- Transformer Blocks -------------
-class TransformerBlock(nn.Module):
+class OptimizedTransformerBlock(nn.Module):
+    """Transformer block using scaled-dot attention for better throughput."""
+
     def __init__(self, d_model, n_heads, d_ff, attn_dropout=0.1, resid_dropout=0.1):
         super().__init__()
+        self.n_heads = n_heads
+        self.d_model = d_model
+        self.head_dim = d_model // n_heads
+        assert self.head_dim * n_heads == d_model, "d_model must be divisible by n_heads"
+
         self.ln1 = nn.LayerNorm(d_model)
-        self.attn = nn.MultiheadAttention(d_model, n_heads, dropout=attn_dropout, batch_first=True)
         self.ln2 = nn.LayerNorm(d_model)
+
+        self.q_proj = nn.Linear(d_model, d_model)
+        self.k_proj = nn.Linear(d_model, d_model)
+        self.v_proj = nn.Linear(d_model, d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
+
+        self.attn_dropout = attn_dropout
+
         self.mlp = nn.Sequential(
             nn.Linear(d_model, d_ff),
             nn.GELU(),
@@ -248,16 +264,30 @@ class TransformerBlock(nn.Module):
             nn.Dropout(resid_dropout),
         )
 
-    def forward(self, x, attn_mask, key_padding_mask=None):
-        # x: (B, L, d)
-        h = self.ln1(x)
-        # attn_mask: (L, L) with True for disallowed positions (causal)
-        attn_out, _ = self.attn(
-            h, h, h,
-            attn_mask=attn_mask,
-            key_padding_mask=key_padding_mask
+    def forward(self, x: torch.Tensor, combined_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Perform attention + MLP with a precomputed causal/padding mask."""
+        B, L, _ = x.shape
+
+        residual = x
+        x = self.ln1(x)
+
+        q = self.q_proj(x).view(B, L, self.n_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(x).view(B, L, self.n_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(x).view(B, L, self.n_heads, self.head_dim).transpose(1, 2)
+
+        attn_out = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=combined_mask,
+            dropout_p=self.attn_dropout if self.training else 0.0,
+            is_causal=False,
         )
-        x = x + attn_out
+
+        attn_out = attn_out.transpose(1, 2).contiguous().view(B, L, self.d_model)
+        attn_out = self.out_proj(attn_out)
+
+        x = residual + attn_out
         x = x + self.mlp(self.ln2(x))
         return x
 
@@ -297,13 +327,17 @@ class TransformerActorCritic(nn.Module):
         # Optional BOS token (learnable)
         self.bos = nn.Parameter(torch.zeros(1, 1, d_model)) if use_bos_token else None
 
-        # Pre-computed causal mask (trimmed at runtime)
-        causal = torch.triu(torch.ones(pos_tokens, pos_tokens, dtype=torch.bool), diagonal=1)
-        self.register_buffer("causal_mask_cache", causal, persistent=False)
+        # Base causal mask with float weights so SDPA can consume it directly
+        causal = torch.zeros(pos_tokens, pos_tokens)
+        causal = causal.masked_fill(
+            torch.triu(torch.ones(pos_tokens, pos_tokens, dtype=torch.bool), diagonal=1),
+            float('-inf')
+        )
+        self.register_buffer("causal_mask_base", causal, persistent=False)
 
         # Transformer blocks
         self.blocks = nn.ModuleList([
-            TransformerBlock(d_model, n_heads, d_ff, attn_dropout=attn_dropout, resid_dropout=resid_dropout)
+            OptimizedTransformerBlock(d_model, n_heads, d_ff, attn_dropout=attn_dropout, resid_dropout=resid_dropout)
             for _ in range(n_layers)
         ])
         self.ln_f = nn.LayerNorm(d_model)
@@ -327,10 +361,21 @@ class TransformerActorCritic(nn.Module):
         if self.bos is not None:
             nn.init.normal_(self.bos, std=0.02)
 
-    def _causal_mask(self, L: int, device: torch.device):
-        if hasattr(self, "causal_mask_cache") and self.causal_mask_cache.size(0) >= L:
-            return self.causal_mask_cache[:L, :L]
-        mask = torch.triu(torch.ones(L, L, dtype=torch.bool, device=device), diagonal=1)
+    def _prepare_mask(self, seq_lens: torch.Tensor, L: int, device: torch.device) -> torch.Tensor:
+        """Create a combined causal + padding mask for scaled-dot attention."""
+        B = seq_lens.size(0)
+        base = self.causal_mask_base[:L, :L]
+        mask = base.unsqueeze(0).unsqueeze(0).expand(B, 1, L, L).clone()
+
+        idx = torch.arange(L, device=device).unsqueeze(0)
+        if self.use_bos_token:
+            valid_len = (seq_lens + 1).unsqueeze(1)
+        else:
+            valid_len = seq_lens.unsqueeze(1)
+
+        is_pad = idx >= valid_len
+        pad_mask = is_pad.view(B, 1, 1, L)
+        mask = mask.masked_fill(pad_mask, float('-inf'))
         return mask
 
     def _encode_sequence(self, seq_feats: torch.Tensor, seq_lens: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -360,22 +405,10 @@ class TransformerActorCritic(nn.Module):
 
         x = x + pos
         Lp = x.size(1)
-
-        causal_mask = self._causal_mask(Lp, device)     # (Lp, Lp) bool
-
-        # key_padding_mask: True = position to ignore
-        if self.use_bos_token:
-            # BOS is always valid, padding starts after 1 = seq_len
-            pad = torch.arange(Lp, device=device).unsqueeze(0)  # (1, Lp)
-            # valid posistion: 0..seq_len (inclusive, BOS + tokens)
-            valid_len = (seq_lens + 1).unsqueeze(1)     # (B, 1)
-        else:
-            pad = torch.arange(Lp, device=device).unsqueeze(0)
-            valid_len = seq_lens.unsqueeze(1)
-        key_padding_mask = pad >= valid_len     # (B, Lp)
+        combined_mask = self._prepare_mask(seq_lens, Lp, device).to(x.dtype)
 
         for blk in self.blocks:
-            x = blk(x, causal_mask, key_padding_mask)
+            x = blk(x, combined_mask)
 
         x = self.ln_f(x)
         return x, last_idx
@@ -393,7 +426,6 @@ class TransformerActorCritic(nn.Module):
             values: (B,)  value estimates
         """
         B, L, _ = seq_feats.shape
-        device = seq_feats.device
 
         # Encode sequence and gather final hidden state for each sample
         h_all, last_idx = self._encode_sequence(seq_feats, seq_lens)
@@ -431,13 +463,18 @@ class PPOAgent:
     def __init__(self, config=None, device=None,
                  teacher_mode: str = 'pubeval', teacher_module=None):
         self.config = config or CFG
-        self.device = device or get_device()
+        raw_device = device or get_device()
+        self.device = torch.device(raw_device) if isinstance(raw_device, str) else raw_device
         mode = (teacher_mode or 'none').lower()
         if mode not in ('pubeval', 'gnubg', 'none'):
             print(f"Unknown teacher '{teacher_mode}', defaulting to 'none'.")
             mode = 'none'
         self.teacher_type = mode
         self.teacher_module = teacher_module if mode != 'none' else None
+
+        device_type = self.device.type if isinstance(self.device, torch.device) else str(self.device)
+        self.amp_enabled = bool(self.config.use_amp and torch.cuda.is_available() and device_type == 'cuda')
+        self.scaler = torch.cuda.amp.GradScaler(enabled=self.amp_enabled)
 
         self.acnet = TransformerActorCritic(
             state_dim=self.config.state_dim,
@@ -489,6 +526,7 @@ class PPOAgent:
         print(f"  LR: {self.config.lr} (gentler)")
         print(f"  Transformer: d={self.config.d_model}, L={self.config.n_layers}, H={self.config.n_heads}, FF={self.config.d_ff}")
         print(f"  Max seq: {self.config.max_seq_len}, BOS={self.config.use_bos_token}")
+        print(f"  AMP enabled: {self.amp_enabled}")
         teacher_label = self.teacher_type if self.teacher_module is not None else 'disabled'
         print(f"  Teacher source: {teacher_label}")
 
@@ -915,49 +953,57 @@ class PPOAgent:
                 mb_oldv = old_values_t[mb]
                 mb_teacher = teacher_indices_t[mb]
 
-                logits, value_preds = self.acnet(mb_seq, mb_len, mb_cand, mb_mask)
+                autocast_ctx = torch.cuda.amp.autocast(enabled=self.amp_enabled) if self.amp_enabled else nullcontext()
+                with autocast_ctx:
+                    logits, value_preds = self.acnet(mb_seq, mb_len, mb_cand, mb_mask)
 
-                log_probs_all = F.log_softmax(logits.masked_fill(mb_mask == 0, -1e9), dim=-1)
-                log_probs = log_probs_all.gather(1, mb_act.unsqueeze(1)).squeeze(1)
+                    masked_logits = logits.masked_fill(mb_mask == 0, -1e9)
+                    log_probs_all = F.log_softmax(masked_logits, dim=-1)
+                    log_probs = log_probs_all.gather(1, mb_act.unsqueeze(1)).squeeze(1)
 
-                ratio = torch.exp(log_probs - mb_oldlp)
-                ratio = torch.clamp(ratio, 0.5, 2.0)  # extra clamp for stability
+                    ratio = torch.exp(log_probs - mb_oldlp)
+                    ratio = torch.clamp(ratio, 0.5, 2.0)
 
-                surr1 = ratio * mb_adv
-                surr2 = torch.clamp(ratio, 1.0 - self.config.clip_epsilon, 1.0 + self.config.clip_epsilon) * mb_adv
-                policy_loss = -torch.min(surr1, surr2).mean()
+                    surr1 = ratio * mb_adv
+                    surr2 = torch.clamp(ratio, 1.0 - self.config.clip_epsilon, 1.0 + self.config.clip_epsilon) * mb_adv
+                    policy_loss = -torch.min(surr1, surr2).mean()
 
-                v_t = value_preds
-                v_t_old = mb_oldv
-                v_t_clipped = v_t_old + torch.clamp(v_t - v_t_old, -self.config.clip_epsilon, self.config.clip_epsilon)
-                v_unclipped = (v_t - mb_ret).pow(2)
-                v_clipped = (v_t_clipped - mb_ret).pow(2)
-                value_loss = 0.5 * torch.max(v_unclipped, v_clipped).mean()
+                    v_t = value_preds
+                    v_t_old = mb_oldv
+                    v_t_clipped = v_t_old + torch.clamp(v_t - v_t_old, -self.config.clip_epsilon, self.config.clip_epsilon)
+                    v_unclipped = (v_t - mb_ret).pow(2)
+                    v_clipped = (v_t_clipped - mb_ret).pow(2)
+                    value_loss = 0.5 * torch.max(v_unclipped, v_clipped).mean()
 
-                probs = F.softmax(logits.masked_fill(mb_mask == 0, -1e9), dim=-1)
-                entropy = -(probs * log_probs_all).sum(dim=-1).mean()
+                    probs = F.softmax(masked_logits, dim=-1)
+                    entropy = -(probs * log_probs_all).sum(dim=-1).mean()
 
-                # Teacher loss
-                max_actions = mb_mask.size(1)
-                valid_teacher = (mb_teacher >= 0) & (mb_teacher < max_actions)
-                if valid_teacher.any():
-                    safe_idx = mb_teacher.clamp(0, max_actions - 1)
-                    teacher_lp = log_probs_all.gather(1, safe_idx.unsqueeze(1)).squeeze(1)
-                    teacher_loss = -teacher_lp[valid_teacher].mean()
+                    max_actions = mb_mask.size(1)
+                    valid_teacher = (mb_teacher >= 0) & (mb_teacher < max_actions)
+                    if valid_teacher.any():
+                        safe_idx = mb_teacher.clamp(0, max_actions - 1)
+                        teacher_lp = log_probs_all.gather(1, safe_idx.unsqueeze(1)).squeeze(1)
+                        teacher_loss = -teacher_lp[valid_teacher].mean()
+                    else:
+                        teacher_loss = logits.new_zeros(())
+
+                    alpha0 = self.config.teacher_loss_coef_start
+                    horizon = self.config.teacher_decay_horizon
+                    alpha = alpha0 * max(0.0, 0.5 * (1 + math.cos(math.pi * min(self.steps, horizon) / horizon)))
+
+                    loss = policy_loss + self.config.critic_coef * value_loss - self.current_entropy_coef * entropy + alpha * teacher_loss
+
+                self.optimizer.zero_grad(set_to_none=True)
+                if self.amp_enabled:
+                    self.scaler.scale(loss).backward()
+                    self.scaler.unscale_(self.optimizer)
+                    grad_norm = torch.nn.utils.clip_grad_norm_(self.acnet.parameters(), self.config.max_grad_norm)
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
                 else:
-                    teacher_loss = torch.tensor(0.0, device=self.device)
-
-                # Cosine decay for teacher coefficient
-                alpha0 = self.config.teacher_loss_coef_start
-                horizon = self.config.teacher_decay_horizon
-                alpha = alpha0 * max(0.0, 0.5 * (1 + math.cos(math.pi * min(self.steps, horizon) / horizon)))
-
-                loss = (policy_loss + self.config.critic_coef * value_loss - self.current_entropy_coef * entropy + alpha * teacher_loss)
-
-                self.optimizer.zero_grad()
-                loss.backward()
-                grad_norm = torch.nn.utils.clip_grad_norm_(self.acnet.parameters(), self.config.max_grad_norm)
-                self.optimizer.step()
+                    loss.backward()
+                    grad_norm = torch.nn.utils.clip_grad_norm_(self.acnet.parameters(), self.config.max_grad_norm)
+                    self.optimizer.step()
 
                 total_policy_loss += policy_loss.item()
                 total_value_loss += value_loss.item()
