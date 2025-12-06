@@ -241,14 +241,21 @@ def plot_perf_multi(perf_data, start_game, n_games, n_epochs, title='Training Pe
     plt.close()
 
 
-def plot_elo_history(elo_history, n_games, title='ELO Progress', timestamp=None):
-    """Plot ELO rating vs games played."""
-    if not elo_history:
+def plot_elo_history(elo_series, n_games, title='ELO Progress', timestamp=None):
+    """Plot ELO rating vs games played for multiple opponents."""
+    if not elo_series:
         return
 
-    xs, ys = zip(*elo_history)
     fig, ax = plt.subplots(figsize=(10, 5))
-    ax.plot(xs, ys, marker='o', linewidth=2, markersize=5, label='ELO rating')
+    if isinstance(elo_series, dict):
+        for label, series in elo_series.items():
+            if not series:
+                continue
+            xs, ys = zip(*series)
+            ax.plot(xs, ys, marker='o', linewidth=2, markersize=5, label=label)
+    else:
+        xs, ys = zip(*elo_series)
+        ax.plot(xs, ys, marker='o', linewidth=2, markersize=5, label='ELO rating')
     ax.set_xlabel('Games played', fontsize=12)
     ax.set_ylabel('ELO rating', fontsize=12)
     ax.set_title(title, fontsize=14, fontweight='bold')

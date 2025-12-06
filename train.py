@@ -17,7 +17,7 @@ from pathlib import Path
 import os
 import random
 import copy
-from collections import Counter, deque, OrderedDict
+from collections import Counter, deque, OrderedDict, defaultdict
 import torch
 import torch.nn.functional as F
 torch.backends.cudnn.benchmark = True
@@ -185,6 +185,7 @@ class TrainingState:
     opponent_ctor_kwargs: dict = field(default_factory=dict)
     opponent_config_template: object = None
     elo_history: list = field(default_factory=list)
+    elo_history_series: dict = field(default_factory=dict)
     perf_data: dict = field(default_factory=lambda: {
     'vs_baseline': [],
     'vs_baseline_lookahead': [],
@@ -279,6 +280,18 @@ def record_recent_usage(state: TrainingState, opponent_type: str, count: int):
                 del state.recent_counts[removed]
         state.recent_opponents.append(opponent_type)
         state.recent_counts[opponent_type] = state.recent_counts.get(opponent_type, 0) + 1
+
+
+def record_elo_point(state: TrainingState, opponent_id: str):
+    profile = state.opponent_profiles.get(opponent_id)
+    if not profile or not state.elo_tracker:
+        return
+    label = profile.label
+    rating = state.elo_tracker.get_rating(opponent_id)
+    series = state.elo_history_series.setdefault(label, [])
+    series.append((state.games_done, rating))
+    if opponent_id == state.current_agent_id:
+        state.elo_history = list(series)
 
 
 def compute_challenge_weight(state: TrainingState, opponent_id: str,
@@ -733,7 +746,19 @@ def initialize_training(
     register_opponent_profile(state, "gnubg", "GNU Backgammon", "gnubg", slow=True)
     register_opponent_profile(state, "best_checkpoint", "Best Checkpoint", "pool_best")
     sync_pool_profiles(state)
-    state.elo_history.append((0, state.elo_tracker.get_rating(state.current_agent_id)))
+    state.elo_history_series = {}
+    def _init_series(opponent_id):
+        profile = state.opponent_profiles.get(opponent_id)
+        if not profile:
+            return
+        label = profile.label
+        rating = state.elo_tracker.get_rating(opponent_id)
+        state.elo_history_series[label] = [(0, rating)]
+    _init_series(state.current_agent_id)
+    _init_series('pubeval')
+    _init_series('gnubg')
+    _init_series('random')
+    state.elo_history = list(state.elo_history_series.get('Current Agent', []))
 
     print(f"\n{'='*60}")
     print("TRAINING CONFIGURATION")
@@ -1054,7 +1079,10 @@ def validation_step(state: TrainingState):
         print(f"  vs Random:        {wr_random:5.1f}%")
         print(f"{'='*70}\n")
         print_elo_standings(state)
-        state.elo_history.append((state.games_done, state.elo_tracker.get_rating(state.current_agent_id)))
+        record_elo_point(state, state.current_agent_id)
+        record_elo_point(state, 'pubeval')
+        record_elo_point(state, 'gnubg')
+        record_elo_point(state, 'random')
         
         # Check if new best (use GNU BG as primary metric)
         if wr_gnubg > state.best_wr:
@@ -1191,7 +1219,7 @@ def train(
         timestamp=state.timestamp
     )
     plot_elo_history(
-        state.elo_history,
+        state.elo_history_series,
         n_games=n_games,
         title=f"ELO Progress ({state.model_size.upper()} model)",
         timestamp=state.timestamp
