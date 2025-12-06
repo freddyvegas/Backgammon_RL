@@ -965,7 +965,7 @@ class PPOAgent:
                     log_probs = log_probs_all.gather(1, mb_act.unsqueeze(1)).squeeze(1)
 
                     ratio = torch.exp(log_probs - mb_oldlp)
-                    ratio = torch.clamp(ratio, 0.5, 2.0)
+                    #ratio = torch.clamp(ratio, 0.5, 2.0)
 
                     surr1 = ratio * mb_adv
                     surr2 = torch.clamp(ratio, 1.0 - self.config.clip_epsilon, 1.0 + self.config.clip_epsilon) * mb_adv

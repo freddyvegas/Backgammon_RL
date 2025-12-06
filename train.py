@@ -489,6 +489,8 @@ def train_step(state: TrainingState, train_bar: tqdm):
         opponent = ai
         opponent_type = 'self_play'
 
+    train_metadata = {'opponent_type': opponent_type}
+
     # Play batch or sequential
     if state.algo == "baseline-td":
         # Baseline TD-lambda doesn't support batching - play sequentially
@@ -499,9 +501,13 @@ def train_step(state: TrainingState, train_bar: tqdm):
             if state.games_done + finished >= state.n_games:
                 break
     elif state.algo == "ppo" and state.agent_type == 'transformer':
-        finished = play_games_batched_transformer(ai, opponent, batch_size=state.batch_size, training=True)
+        finished = play_games_batched_transformer(
+            ai, opponent, batch_size=state.batch_size, training=True, train_config=train_metadata
+        )
     else:
-        finished = play_games_batched(ai, opponent, batch_size=state.batch_size, training=True)
+        finished = play_games_batched(
+            ai, opponent, batch_size=state.batch_size, training=True, train_config=train_metadata
+        )
 
     if state.games_done + finished > state.n_games:
         finished = state.n_games - state.games_done
@@ -517,7 +523,8 @@ def train_step(state: TrainingState, train_bar: tqdm):
         if slow_batch > 0:
             slow_play_fn = play_games_batched_transformer if state.agent_type == 'transformer' else play_games_batched
             slow_finished = slow_play_fn(
-                ai, gnubg_player, batch_size=slow_batch, training=True
+                ai, gnubg_player, batch_size=slow_batch, training=True,
+                train_config={'opponent_type': 'gnubg'}
             )
             slow_finished = min(slow_finished, state.n_games - (state.games_done + finished))
 

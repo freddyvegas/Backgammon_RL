@@ -15,12 +15,31 @@ import numpy as np
 import torch
 import random
 
-def play_games_batched(agent_obj, opponent, batch_size=8, training=True):
+def play_games_batched(agent_obj, opponent, batch_size=8, training=True, train_config=None):
     """
     Run up to `batch_size` games in parallel and feed batched states to the network.
     Supports both PPO (with batch_score and buffer) and A2C (direct action calls).
     """
     finished = 0
+
+    metadata = dict(train_config) if isinstance(train_config, dict) else {}
+    opponent_type = metadata.get('opponent_type')
+    if opponent_type is None:
+        if opponent is randomAgent:
+            opponent_type = 'random'
+        elif opponent is pubeval:
+            opponent_type = 'pubeval'
+        elif opponent is agent_obj:
+            opponent_type = 'self_play'
+        else:
+            opponent_type = 'opponent'
+        metadata['opponent_type'] = opponent_type
+    else:
+        opponent_type = str(opponent_type)
+
+    use_full_rewards = True
+    if training and hasattr(agent_obj, 'prepare_training_context'):
+        use_full_rewards = agent_obj.prepare_training_context(metadata)
     
     # Detect agent type once at the start
     is_ppo_like = hasattr(agent_obj, "batch_score") and hasattr(agent_obj, "buffer") and hasattr(agent_obj.config, "max_actions")
@@ -150,11 +169,14 @@ def play_games_batched(agent_obj, opponent, batch_size=8, training=True):
 
                 # Compute reward
                 reward = 0.0
-                terminal_reward = 0.0
-                if boards[idx][27] == 15:  # Agent wins
+                win = bool(boards[idx][27] == 15)
+                loss = bool(boards[idx][28] == -15)
+                if win:
                     terminal_reward = 1.0
-                elif boards[idx][28] == -15:  # Agent loses
+                elif loss and use_full_rewards:
                     terminal_reward = -1.0
+                else:
+                    terminal_reward = 0.0
 
                 # Shaped reward
                 shaped_reward = 0.0
@@ -204,6 +226,9 @@ def play_games_batched(agent_obj, opponent, batch_size=8, training=True):
                 done = backgammon.game_over(boards[idx])
                 if done:
                     env_active[idx] = False
+                    if (training and not agent_obj.eval_mode and
+                        hasattr(agent_obj, 'record_curriculum_result')):
+                        agent_obj.record_curriculum_result(opponent_type, 1 if win else -1 if loss else 0)
                     # Flush this env's trajectory to the global PPO buffer (keep it contiguous)
                     for (S_, C_, M_, A_, LP_, V_, R_, D_, T_) in per_env_rollouts[idx]:
                         agent_obj.buffer.push(S_, C_, M_, A_, LP_, V_, R_, D_, T_)
@@ -224,7 +249,10 @@ def play_games_batched(agent_obj, opponent, batch_size=8, training=True):
             # A2C path: direct action calls (no batch scoring, no buffer)
             for (idx, dice, board, pmoves, pboards) in agent_envs:
                 # Agent acts directly (handles its own learning inside action())
-                move = agent_obj.action(board, dice, +1, 0, train=training)
+                move = agent_obj.action(
+                    board, dice, +1, 0, train=training,
+                    train_config=(metadata if training else None)
+                )
                 if not _is_empty_move(move):
                     boards[idx] = _apply_move_sequence(board, move, +1)
 
@@ -232,6 +260,9 @@ def play_games_batched(agent_obj, opponent, batch_size=8, training=True):
                 done = backgammon.game_over(boards[idx])
                 if done:
                     env_active[idx] = False
+                    if (training and hasattr(agent_obj, 'record_curriculum_result')):
+                        outcome = 1 if boards[idx][27] == 15 else -1 if boards[idx][28] == -15 else 0
+                        agent_obj.record_curriculum_result(opponent_type, outcome)
                     finished += 1
                 else:
                     passes_left[idx] -= 1
@@ -263,8 +294,10 @@ def play_games_batched(agent_obj, opponent, batch_size=8, training=True):
             if done:
                 if is_ppo_like:
                     # PPO path: retro-credit opponent win to last agent step
-                    if training and not agent_obj.eval_mode and boards[idx][28] == -15:
-                        loss_reward = -1.0 * agent_obj.config.reward_scale
+                    agent_lost = bool(boards[idx][28] == -15)
+                    loss_scalar = -1.0 if (agent_lost and use_full_rewards) else 0.0
+                    loss_reward = loss_scalar * agent_obj.config.reward_scale
+                    if training and not agent_obj.eval_mode:
                         if per_env_rollouts[idx]:
                             # Update last transition with loss reward
                             (S_, C_, M_, A_, LP_, V_, R_, D_, T_) = per_env_rollouts[idx][-1]
@@ -278,6 +311,8 @@ def play_games_batched(agent_obj, opponent, batch_size=8, training=True):
                             M = np.zeros(agent_obj.config.max_actions, dtype=np.float32)
                             M[0] = 1.0
                             per_env_rollouts[idx].append((S_feat, C_feats, M, 0, 0.0, 0.0, loss_reward, 1.0, -1))
+                        if hasattr(agent_obj, 'record_curriculum_result') and agent_lost:
+                            agent_obj.record_curriculum_result(opponent_type, -1)
 
                     # Flush this env's trajectory to buffer
                     env_active[idx] = False
@@ -360,9 +395,28 @@ def select_move_with_lookahead(agent_obj, board_pov, dice, i, k=3):
 
     return possible_moves[best_idx]
 
-def play_games_batched_transformer(agent_obj, opponent, batch_size=8, training=True):
+def play_games_batched_transformer(agent_obj, opponent, batch_size=8, training=True, train_config=None):
     """Batched self-play loop optimized for the transformer PPO agent."""
     finished = 0
+
+    metadata = dict(train_config) if isinstance(train_config, dict) else {}
+    opponent_type = metadata.get('opponent_type')
+    if opponent_type is None:
+        if opponent is randomAgent:
+            opponent_type = 'random'
+        elif opponent is pubeval:
+            opponent_type = 'pubeval'
+        elif opponent is agent_obj:
+            opponent_type = 'self_play'
+        else:
+            opponent_type = 'opponent'
+        metadata['opponent_type'] = opponent_type
+    else:
+        opponent_type = str(opponent_type)
+
+    use_full_rewards = True
+    if training and hasattr(agent_obj, 'prepare_training_context'):
+        use_full_rewards = agent_obj.prepare_training_context(metadata)
 
     # Per-env containers
     env_active  = [True] * batch_size
@@ -529,7 +583,14 @@ def play_games_batched_transformer(agent_obj, opponent, batch_size=8, training=T
                 boards[idx] = backgammon.update_board(boards[idx], chosen_move, 1)
 
                 # Rewards
-                terminal_reward = 1.0 if boards[idx][27] == 15 else (-1.0 if boards[idx][28] == -15 else 0.0)
+                win = bool(boards[idx][27] == 15)
+                loss = bool(boards[idx][28] == -15)
+                if win:
+                    terminal_reward = 1.0
+                elif loss and use_full_rewards:
+                    terminal_reward = -1.0
+                else:
+                    terminal_reward = 0.0
                 shaped_reward = 0.0
                 if training and not agent_obj.eval_mode and agent_obj.config.use_reward_shaping:
                     board_pov_old = flip_to_pov_plus1(old_board, 1)
@@ -537,6 +598,8 @@ def play_games_batched_transformer(agent_obj, opponent, batch_size=8, training=T
                     shaped_reward = agent_obj._compute_shaped_reward(board_pov_old, board_pov_new)
                 reward = (terminal_reward + shaped_reward) * agent_obj.config.reward_scale
                 done = 1.0 if backgammon.game_over(boards[idx]) else 0.0
+                if done and training and not agent_obj.eval_mode and hasattr(agent_obj, 'record_curriculum_result'):
+                    agent_obj.record_curriculum_result(opponent_type, 1 if win else -1 if loss else 0)
 
                 # Append the post-action observation token
                 append_token(
@@ -652,8 +715,9 @@ def play_games_batched_transformer(agent_obj, opponent, batch_size=8, training=T
                     )
 
                     if backgammon.game_over(boards[idx]):
-                        if training and not agent_obj.eval_mode and boards[idx][28] == -15:
-                            loss_reward = -1.0 * agent_obj.config.reward_scale
+                        if training and not agent_obj.eval_mode:
+                            loss_scalar = -1.0 if (boards[idx][28] == -15 and use_full_rewards) else 0.0
+                            loss_reward = loss_scalar * agent_obj.config.reward_scale
                             if per_env_rollouts[idx]:
                                 (SEQ_, SEQL_, C_, M_, A_, LP_, V_, R_, D_, T_) = per_env_rollouts[idx][-1]
                                 per_env_rollouts[idx][-1] = (SEQ_, SEQL_, C_, M_, A_, LP_, V_, R_ + loss_reward, 1.0, T_)
@@ -667,7 +731,8 @@ def play_games_batched_transformer(agent_obj, opponent, batch_size=8, training=T
                                 per_env_rollouts[idx].append(
                                     (seq_padded_np, int(seq_len), C_feats, M, 0, 0.0, 0.0, float(loss_reward), 1.0, -1)
                                 )
-
+                            if hasattr(agent_obj, 'record_curriculum_result') and boards[idx][28] == -15:
+                                agent_obj.record_curriculum_result(opponent_type, -1)
                         finalize_episode(idx)
                     else:
                         passes_left[idx] -= 1
@@ -699,8 +764,9 @@ def play_games_batched_transformer(agent_obj, opponent, batch_size=8, training=T
                     )
 
                     if backgammon.game_over(boards[idx]):
-                        if training and not agent_obj.eval_mode and boards[idx][28] == -15:
-                            loss_reward = -1.0 * agent_obj.config.reward_scale
+                        if training and not agent_obj.eval_mode:
+                            loss_scalar = -1.0 if (boards[idx][28] == -15 and use_full_rewards) else 0.0
+                            loss_reward = loss_scalar * agent_obj.config.reward_scale
                             if per_env_rollouts[idx]:
                                 (SEQ_, SEQL_, C_, M_, A_, LP_, V_, R_, D_, T_) = per_env_rollouts[idx][-1]
                                 per_env_rollouts[idx][-1] = (SEQ_, SEQL_, C_, M_, A_, LP_, V_, R_ + loss_reward, 1.0, T_)
@@ -714,7 +780,8 @@ def play_games_batched_transformer(agent_obj, opponent, batch_size=8, training=T
                                 per_env_rollouts[idx].append(
                                     (seq_padded_np, int(seq_len), C_feats, M, 0, 0.0, 0.0, float(loss_reward), 1.0, -1)
                                 )
-
+                            if hasattr(agent_obj, 'record_curriculum_result') and boards[idx][28] == -15:
+                                agent_obj.record_curriculum_result(opponent_type, -1)
                         finalize_episode(idx)
                     else:
                         passes_left[idx] -= 1

@@ -48,7 +48,7 @@ class Config:
     entropy_decay = 0.9999
     entropy_min = 0.01
 
-    critic_coef = 1.0
+    critic_coef = 1.5
     eval_temperature = 0.01
 
     # PPO rollout settings
@@ -74,6 +74,13 @@ class Config:
 
     # Reward scaling
     reward_scale = 1.0
+
+    # Reward curriculum (delay negative rewards)
+    use_reward_curriculum = True
+    curriculum_min_games = 2_500        # keep rewards positive for at least this many games
+    curriculum_force_games = 5_000      # hard-enable ±1 after this many games
+    curriculum_random_min_games = 256    # need this many random matches before trusting win rate
+    curriculum_random_winrate = 0.52     # unlock once win-rate vs random exceeds this
 
     # Reward shaping (DISABLED)
     use_reward_shaping = False
@@ -428,6 +435,15 @@ class PPOAgent:
         print(f"  Teacher signal: {self.config.teacher_sample_rate*100:.0f}% sample rate")
         print(f"  Teacher source: {teacher_label}")
 
+        # Reward curriculum tracking
+        self.curriculum_games_played = 0
+        self.curriculum_random_games = 0
+        self.curriculum_random_wins = 0
+        self._last_random_eval_wr = None
+        self._full_reward_unlocked = not getattr(self.config, 'use_reward_curriculum', False)
+        self._current_opponent_type = None
+        self._current_batch_use_full = self._full_reward_unlocked
+
     def _teacher_enabled(self) -> bool:
         return (
             self.teacher_module is not None and
@@ -437,6 +453,115 @@ class PPOAgent:
 
     def has_teacher(self) -> bool:
         return self._teacher_enabled()
+
+    def prepare_training_context(self, train_config=None):
+        """
+        Update curriculum context for the next batch/episode and return whether to
+        apply full ±1 terminal rewards.
+        """
+        if not getattr(self.config, 'use_reward_curriculum', False):
+            self._current_batch_use_full = True
+            return True
+
+        if isinstance(train_config, dict):
+            opponent = train_config.get('opponent_type')
+            if opponent is not None:
+                self._current_opponent_type = opponent
+            random_wr = train_config.get('random_win_rate')
+            if random_wr is not None:
+                self._last_random_eval_wr = float(random_wr)
+            if train_config.get('force_full_rewards'):
+                self._full_reward_unlocked = True
+            explicit = train_config.get('use_full_rewards')
+            if explicit is not None:
+                explicit = bool(explicit)
+                if explicit:
+                    self._full_reward_unlocked = True
+                self._current_batch_use_full = explicit
+                return explicit
+
+        use_full = self._should_use_full_terminal_rewards()
+        self._current_batch_use_full = use_full
+        return use_full
+
+    def record_curriculum_result(self, opponent_type, outcome: int):
+        """Record the outcome (+1 win, -1 loss) for curriculum tracking."""
+        if not getattr(self.config, 'use_reward_curriculum', False):
+            return
+        if outcome == 0:
+            return
+
+        self.curriculum_games_played += 1
+        opponent_label = opponent_type or self._current_opponent_type
+        if opponent_label == 'random':
+            self.curriculum_random_games += 1
+            if outcome > 0:
+                self.curriculum_random_wins += 1
+
+        # Check unlock after updating stats
+        self._maybe_unlock_full_rewards()
+
+    def _maybe_unlock_full_rewards(self):
+        if self._full_reward_unlocked:
+            return
+        force_limit = getattr(self.config, 'curriculum_force_games', 0)
+        min_games = getattr(self.config, 'curriculum_min_games', 0)
+        random_threshold = getattr(self.config, 'curriculum_random_winrate', 0.5)
+        min_random_games = getattr(self.config, 'curriculum_random_min_games', 0)
+
+        games = self.curriculum_games_played
+        if force_limit > 0 and games >= force_limit:
+            self._full_reward_unlocked = True
+            return
+        if games < max(1, min_games):
+            return
+
+        random_wr = self._get_random_win_rate()
+        if random_wr is None:
+            return
+
+        enough_random_games = self.curriculum_random_games >= max(1, min_random_games)
+        if enough_random_games and random_wr >= random_threshold:
+            self._full_reward_unlocked = True
+        elif self._last_random_eval_wr is not None and self._last_random_eval_wr >= random_threshold:
+            self._full_reward_unlocked = True
+
+    def _get_random_win_rate(self):
+        if self._last_random_eval_wr is not None:
+            return self._last_random_eval_wr
+        if self.curriculum_random_games == 0:
+            return None
+        return self.curriculum_random_wins / max(1, self.curriculum_random_games)
+
+    def _should_use_full_terminal_rewards(self):
+        if not getattr(self.config, 'use_reward_curriculum', False):
+            return True
+        if self._full_reward_unlocked:
+            return True
+
+        force_limit = getattr(self.config, 'curriculum_force_games', 0)
+        games = self.curriculum_games_played
+        if force_limit > 0 and games >= force_limit:
+            self._full_reward_unlocked = True
+            return True
+
+        min_games = getattr(self.config, 'curriculum_min_games', 0)
+        if games < max(1, min_games):
+            return False
+
+        random_wr = self._get_random_win_rate()
+        if random_wr is None:
+            return False
+
+        threshold = getattr(self.config, 'curriculum_random_winrate', 0.5)
+        min_random_games = getattr(self.config, 'curriculum_random_min_games', 0)
+        enough_random_games = self.curriculum_random_games >= max(1, min_random_games)
+        has_eval_signal = self._last_random_eval_wr is not None
+
+        if (enough_random_games or has_eval_signal) and random_wr >= threshold:
+            self._full_reward_unlocked = True
+            return True
+        return False
 
     def _lr_scale(self, game_count: int) -> float:
         horizon = float(self.training_horizon or 1)
@@ -747,6 +872,10 @@ class PPOAgent:
         # Get buffered data
         states, cand_states, masks, actions, old_log_probs, values, rewards, dones, teacher_indices = self.buffer.get()
 
+        # Normalize rewards per batch before computing GAE to stabilize sparse signals
+        if rewards.size > 1:
+            rewards = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
+
         # Compute advantages and returns
         advantages, returns = self._compute_gae(rewards, values, dones)
 
@@ -894,6 +1023,10 @@ class PPOAgent:
 
     def action(self, board_copy, dice, player, i, train=False, train_config=None):
         """Select action with optional teacher signal collection."""
+        use_full_rewards = True
+        if train and not self.eval_mode:
+            use_full_rewards = self.prepare_training_context(train_config)
+
         board_pov = _flip_board(board_copy) if player == -1 else board_copy
         possible_moves, possible_boards = backgammon.legal_moves(board_pov, dice, player=1)
         nA = len(possible_moves)
@@ -906,10 +1039,20 @@ class PPOAgent:
             chosen_move = possible_moves[0]
             chosen_board = possible_boards[0]
 
-            terminal_reward = 1.0 if (chosen_board[27] == 15) else 0.0
+            win = bool(chosen_board[27] == 15)
+            lose = bool(chosen_board[28] == -15)
+            if win:
+                terminal_reward = 1.0
+            elif lose and use_full_rewards:
+                terminal_reward = -1.0
+            else:
+                terminal_reward = 0.0
             shaped_reward = self._compute_shaped_reward(board_pov, chosen_board) if train else 0.0
             total_reward = terminal_reward + shaped_reward
-            done = bool(terminal_reward > 0.0)
+            done = bool(win or lose)
+
+            if done and train and not self.eval_mode:
+                self.record_curriculum_result(self._current_opponent_type, 1 if win else -1 if lose else 0)
 
             if train and not self.eval_mode:
                 moves_left = 1 + int(dice[0] == dice[1]) - i
@@ -997,10 +1140,20 @@ class PPOAgent:
         chosen_board = possible_boards[a_idx]
 
         # Reward
-        terminal_reward = 1.0 if (chosen_board[27] == 15) else 0.0
+        win = bool(chosen_board[27] == 15)
+        lose = bool(chosen_board[28] == -15)
+        if win:
+            terminal_reward = 1.0
+        elif lose and use_full_rewards:
+            terminal_reward = -1.0
+        else:
+            terminal_reward = 0.0
         shaped_reward = self._compute_shaped_reward(board_pov, chosen_board) if train else 0.0
         total_reward = terminal_reward + shaped_reward
-        done = bool(terminal_reward > 0.0)
+        done = bool(win or lose)
+
+        if done and train and not self.eval_mode:
+            self.record_curriculum_result(self._current_opponent_type, 1 if win else -1 if lose else 0)
 
         # Get teacher label (NEW!)
         teacher_idx = -1
