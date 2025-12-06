@@ -41,19 +41,19 @@ class Config:
     lr = 5e-5              # Gentler default
     gamma = 0.99
     gae_lambda = 0.95
-    clip_epsilon = 0.1     # Reduced from 0.2 → 0.1
+    clip_epsilon = 0.2
 
     # Exploration
     entropy_coef = 0.02
     entropy_decay = 0.9999
-    entropy_min = 0.0
+    entropy_min = 0.01
 
     critic_coef = 1.0
     eval_temperature = 0.01
 
     # PPO rollout settings
     rollout_length = 512
-    ppo_epochs = 2         # Reduced from 4 → 2
+    ppo_epochs = 3
     minibatch_size = 128
 
     # Network architecture (ResMLP) - DEFAULT: LARGE
@@ -101,9 +101,6 @@ class SmallConfig(Config):
     resid_dropout = 0.05
     rollout_length = 256
     minibatch_size = 64
-    lr = 5e-5  # Gentler
-    ppo_epochs = 2  # Gentler
-    clip_epsilon = 0.1  # Gentler
     use_reward_shaping = False
 
 
@@ -113,7 +110,7 @@ class MediumConfig(Config):
     n_blocks = 4
     rollout_length = 384
     minibatch_size = 96
-    resid_dropout = 0.025
+    resid_dropout = 0.05
 
 
 class LargeConfig(Config):
@@ -121,14 +118,11 @@ class LargeConfig(Config):
     model_dim = 640
     n_blocks = 8
     ff_mult = 2.5
-    resid_dropout = 0.0
+    resid_dropout = 0.1
     delta_hidden_mult = 2.0
     value_hidden_mult = 1.0
     rollout_length = 640
     minibatch_size = 160
-    lr = 5e-5
-    clip_epsilon = 0.1
-    ppo_epochs = 2
     compile_model = True
 
 
@@ -816,9 +810,6 @@ class PPOAgent:
 
                 # PPO policy loss
                 ratio = torch.exp(log_probs - mb_old_log_probs)
-
-                # CRITICAL FIX: Clamp ratio to prevent extreme ratios
-                ratio = torch.clamp(ratio, 0.5, 2.0)
 
                 surr1 = ratio * mb_advantages
                 surr2 = torch.clamp(ratio, 1.0 - self.config.clip_epsilon, 1.0 + self.config.clip_epsilon) * mb_advantages
