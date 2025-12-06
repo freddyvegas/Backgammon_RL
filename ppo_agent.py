@@ -77,8 +77,8 @@ class Config:
 
     # Reward curriculum (delay negative rewards)
     use_reward_curriculum = True
-    curriculum_min_games = 2_500        # keep rewards positive for at least this many games
-    curriculum_force_games = 5_000      # hard-enable ±1 after this many games
+    curriculum_min_games = 0       # keep rewards positive for at least this many games
+    curriculum_force_games = 0      # hard-enable ±1 after this many games
     curriculum_random_min_games = 256    # need this many random matches before trusting win rate
     curriculum_random_winrate = 0.52     # unlock once win-rate vs random exceeds this
 

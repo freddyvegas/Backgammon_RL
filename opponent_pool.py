@@ -11,6 +11,7 @@ from pathlib import Path
 import random
 import shutil
 import importlib
+import copy
 import torch
 
 
@@ -41,7 +42,8 @@ class OpponentPool:
     """
 
     def __init__(self, pool_dir: Path, agent_module_name: str = "ppo_agent",
-                 max_size: int = 12, seed: int = 42, device: str = None):
+                 max_size: int = 12, seed: int = 42, device: str = None,
+                 ctor_kwargs: dict = None, config_template=None):
         """
         Args:
             pool_dir: Directory to store opponent snapshots
@@ -56,6 +58,8 @@ class OpponentPool:
         self.max_size = max_size
         self.snapshots = []  # list[(path: Path, snapshot_id: int)]
         self._snapshot_counter = 0
+        self.ctor_kwargs = dict(ctor_kwargs or {})
+        self.config_template = config_template
         
         # Determine device for opponents
         if device is not None:
@@ -73,6 +77,20 @@ class OpponentPool:
         print(f"  Max size: {max_size}")
         print(f"  Device: {self.device}")
         print(f"  Existing snapshots: {len(self.snapshots)}")
+
+    def _load_opponent_from_path(self, snapshot_path: Path, snapshot_id: int):
+        agent_mod = importlib.import_module(self.agent_module_name)
+        kwargs = dict(self.ctor_kwargs)
+        if self.config_template is not None:
+            kwargs['config'] = copy.deepcopy(self.config_template)
+        try:
+            opponent = agent_mod.PPOAgent(**kwargs)
+        except TypeError:
+            opponent = agent_mod.PPOAgent()
+        opponent.load(str(snapshot_path), map_location=self.device, load_optimizer=False)
+        opponent.set_eval_mode(True)
+        opponent._opponent_id = f"pool_{snapshot_id}"
+        return opponent
 
     def _load_existing_snapshots(self):
         """Load existing opponent snapshots from directory."""
@@ -101,8 +119,9 @@ class OpponentPool:
                 print(f"[OpponentPool] Error copying snapshot: {e}")
                 return
 
-        self.snapshots.append((dst, self._snapshot_counter))
-        print(f"[OpponentPool] Added snapshot {self._snapshot_counter} {label}")
+        new_id = self._snapshot_counter
+        self.snapshots.append((dst, new_id))
+        print(f"[OpponentPool] Added snapshot {new_id} {label}")
         self._snapshot_counter += 1
 
         if len(self.snapshots) > self.max_size:
@@ -114,6 +133,7 @@ class OpponentPool:
                 print(f"[OpponentPool] Could not delete {old_path}: {e}")
 
         print(f"[OpponentPool] Pool size: {len(self.snapshots)}/{self.max_size}")
+        return new_id
 
     def sample_opponent(self, bias_recent: bool = True, max_retries: int = 3):
         """
@@ -142,22 +162,8 @@ class OpponentPool:
 
                 snapshot_path, snapshot_id = self.snapshots[idx]
 
-                # Import agent module and create a fresh PPOAgent instance
-                agent_mod = importlib.import_module(self.agent_module_name)
-                
-                # Create opponent with explicit device
-                # Check if PPOAgent accepts device parameter
-                try:
-                    opponent = agent_mod.PPOAgent(device=self.device)
-                except TypeError:
-                    opponent = agent_mod.PPOAgent()
+                opponent = self._load_opponent_from_path(snapshot_path, snapshot_id)
 
-                # Load weights into this instance
-                opponent.load(str(snapshot_path), map_location=self.device, load_optimizer=False)
-                
-                # Set eval mode
-                opponent.set_eval_mode(True)
-                
                 # Verify it loaded correctly
                 if hasattr(opponent, 'steps') and opponent.steps > 0:
                     # Successfully loaded trained weights
@@ -177,6 +183,19 @@ class OpponentPool:
                 # Try again with a different snapshot
                 continue
 
+        return None
+
+    def load_snapshot(self, snapshot_id: int):
+        """Load a specific opponent snapshot by ID."""
+        for snapshot_path, sid in self.snapshots:
+            if sid == snapshot_id:
+                try:
+                    opponent = self._load_opponent_from_path(snapshot_path, sid)
+                    return opponent
+                except Exception as exc:
+                    print(f"[OpponentPool] Error loading snapshot {snapshot_id}: {exc}")
+                    return None
+        print(f"[OpponentPool] Snapshot {snapshot_id} not found in pool")
         return None
 
     def verify_snapshots(self):

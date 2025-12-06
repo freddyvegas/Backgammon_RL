@@ -240,6 +240,32 @@ def plot_perf_multi(perf_data, start_game, n_games, n_epochs, title='Training Pe
     print(f"Training plot saved to {filename}")
     plt.close()
 
+
+def plot_elo_history(elo_history, n_games, title='ELO Progress', timestamp=None):
+    """Plot ELO rating vs games played."""
+    if not elo_history:
+        return
+
+    xs, ys = zip(*elo_history)
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.plot(xs, ys, marker='o', linewidth=2, markersize=5, label='ELO rating')
+    ax.set_xlabel('Games played', fontsize=12)
+    ax.set_ylabel('ELO rating', fontsize=12)
+    ax.set_title(title, fontsize=14, fontweight='bold')
+    ax.grid(True, alpha=0.3)
+    if n_games is not None:
+        ax.set_xlim(0, n_games)
+    ax.legend(loc='best')
+    plt.tight_layout()
+    if timestamp:
+        filename = f'elo_plot_{timestamp}.png'
+    else:
+        from datetime import datetime
+        filename = f'elo_plot_{datetime.now().strftime("%Y%m%d_%H%M%S")}.png'
+    plt.savefig(filename, dpi=150, bbox_inches='tight')
+    print(f"ELO plot saved to {filename}")
+    plt.close()
+
 def _is_empty_move(move):
     if move is None: return True
     if isinstance(move, (list, tuple)): return len(move) == 0

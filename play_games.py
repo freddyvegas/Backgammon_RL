@@ -37,6 +37,8 @@ def play_games_batched(agent_obj, opponent, batch_size=8, training=True, train_c
     else:
         opponent_type = str(opponent_type)
 
+    result_callback = metadata.get('result_callback')
+
     use_full_rewards = True
     if training and hasattr(agent_obj, 'prepare_training_context'):
         use_full_rewards = agent_obj.prepare_training_context(metadata)
@@ -226,6 +228,10 @@ def play_games_batched(agent_obj, opponent, batch_size=8, training=True, train_c
                 done = backgammon.game_over(boards[idx])
                 if done:
                     env_active[idx] = False
+                    if result_callback:
+                        outcome = 1 if win else (-1 if loss else 0)
+                        if outcome:
+                            result_callback(outcome)
                     if (training and not agent_obj.eval_mode and
                         hasattr(agent_obj, 'record_curriculum_result')):
                         agent_obj.record_curriculum_result(opponent_type, 1 if win else -1 if loss else 0)
@@ -260,6 +266,11 @@ def play_games_batched(agent_obj, opponent, batch_size=8, training=True, train_c
                 done = backgammon.game_over(boards[idx])
                 if done:
                     env_active[idx] = False
+                    if result_callback:
+                        if boards[idx][27] == 15:
+                            result_callback(1)
+                        elif boards[idx][28] == -15:
+                            result_callback(-1)
                     if (training and hasattr(agent_obj, 'record_curriculum_result')):
                         outcome = 1 if boards[idx][27] == 15 else -1 if boards[idx][28] == -15 else 0
                         agent_obj.record_curriculum_result(opponent_type, outcome)
@@ -313,6 +324,8 @@ def play_games_batched(agent_obj, opponent, batch_size=8, training=True, train_c
                             per_env_rollouts[idx].append((S_feat, C_feats, M, 0, 0.0, 0.0, loss_reward, 1.0, -1))
                         if hasattr(agent_obj, 'record_curriculum_result') and agent_lost:
                             agent_obj.record_curriculum_result(opponent_type, -1)
+                    if result_callback and agent_lost:
+                        result_callback(-1)
 
                     # Flush this env's trajectory to buffer
                     env_active[idx] = False
@@ -600,6 +613,11 @@ def play_games_batched_transformer(agent_obj, opponent, batch_size=8, training=T
                 done = 1.0 if backgammon.game_over(boards[idx]) else 0.0
                 if done and training and not agent_obj.eval_mode and hasattr(agent_obj, 'record_curriculum_result'):
                     agent_obj.record_curriculum_result(opponent_type, 1 if win else -1 if loss else 0)
+                if done and result_callback:
+                    if win:
+                        result_callback(1)
+                    elif loss:
+                        result_callback(-1)
 
                 # Append the post-action observation token
                 append_token(
@@ -733,6 +751,8 @@ def play_games_batched_transformer(agent_obj, opponent, batch_size=8, training=T
                                 )
                             if hasattr(agent_obj, 'record_curriculum_result') and boards[idx][28] == -15:
                                 agent_obj.record_curriculum_result(opponent_type, -1)
+                        if result_callback and boards[idx][28] == -15:
+                            result_callback(-1)
                         finalize_episode(idx)
                     else:
                         passes_left[idx] -= 1
@@ -782,6 +802,8 @@ def play_games_batched_transformer(agent_obj, opponent, batch_size=8, training=T
                                 )
                             if hasattr(agent_obj, 'record_curriculum_result') and boards[idx][28] == -15:
                                 agent_obj.record_curriculum_result(opponent_type, -1)
+                        if result_callback and boards[idx][28] == -15:
+                            result_callback(-1)
                         finalize_episode(idx)
                     else:
                         passes_left[idx] -= 1
