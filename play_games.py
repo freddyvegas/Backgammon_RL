@@ -39,6 +39,8 @@ def play_games_batched(agent_obj, opponent, batch_size=8, training=True, train_c
 
     result_callback = metadata.get('result_callback')
 
+    result_callback = metadata.get('result_callback')
+
     use_full_rewards = True
     if training and hasattr(agent_obj, 'prepare_training_context'):
         use_full_rewards = agent_obj.prepare_training_context(metadata)
