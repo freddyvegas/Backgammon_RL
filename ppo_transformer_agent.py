@@ -11,7 +11,6 @@ from utils import (
     _flip_move,
     transformer_one_hot_encoding,
     transformer_one_hot_encoding_torch,
-    transformer_start_token,
     pad_truncate_seq,
     get_device,
     TRANSFORMER_STATE_DIM,
@@ -178,10 +177,10 @@ def get_config(size='large'):
 CFG = Config()
 
 # Set device at module level
-CFG.device = get_device()
-print(f"Transformer PPO agent using device: {CFG.device}")
-if CFG.device == "mps":
-    print("  ⚠️  Note: MPS may have stability issues with PPO. Consider using CPU.")
+#CFG.device = get_device()
+#print(f"Transformer PPO agent using device: {CFG.device}")
+#if CFG.device == "mps":
+#    print("  ⚠️  Note: MPS may have stability issues with PPO. Consider using CPU.")
 
 
 # ------------- Rollout Buffer (sequence-aware) -------------
@@ -475,8 +474,6 @@ class PPOAgent:
         # History of POV states (29-dim raw) and features (293-dim one-hot) for the current episode
         self._history_states29: List[np.ndarray] = []
         self._history_feats293: List[np.ndarray] = []
-        self._history_has_start: bool = True
-        self._start_token_np = transformer_start_token()
 
         self.rollout_stats = {
             'policy_loss': [],
@@ -993,13 +990,11 @@ class PPOAgent:
 
     # -------- Sequence helpers --------
     def _get_sequence_feats(self) -> Tuple[np.ndarray, int]:
-        """Return (seq_feats[L,293], true_len) truncated to last N, optionally with BOS handled in model."""
+        """Return (seq_feats[L,293], true_len) truncated to last N recent tokens."""
         seq_padded, seq_len = pad_truncate_seq(
             self._history_feats293,
             self.config.max_seq_len,
             self.config.state_dim,
-            start_token=self._start_token_np,
-            has_start=self._history_has_start
         )
         return seq_padded, seq_len
 
@@ -1016,13 +1011,11 @@ class PPOAgent:
 
     def _append_history_feature(self, feat: np.ndarray):
         self._history_feats293.append(feat.copy())
-        limit = self.config.max_seq_len - 1 if self._history_has_start else self.config.max_seq_len
+        limit = self.config.max_seq_len
         if len(self._history_feats293) > limit:
             overflow = len(self._history_feats293) - limit
             if overflow > 0:
                 del self._history_feats293[:overflow]
-                if self._history_has_start:
-                    self._history_has_start = False
 
     # -------- Action selection --------
     def action(self, board_copy, dice, player, i, train=False, train_config=None):
@@ -1140,7 +1133,6 @@ class PPOAgent:
     def episode_start(self):
         self._history_states29.clear()
         self._history_feats293.clear()
-        self._history_has_start = True
 
     def end_episode(self, outcome, final_board, perspective):
         # Could log episode-level stats here if desired

@@ -164,10 +164,10 @@ def get_config(size='large'):
 CFG = Config()
 
 # Set device at module level
-CFG.device = get_device()
-print(f"PPO agent using device: {CFG.device}")
-if CFG.device == "mps":
-    print("  ⚠️  Note: MPS may have stability issues with PPO. Consider using CPU.")
+#CFG.device = get_device()
+#print(f"PPO agent using device: {CFG.device}")
+#if CFG.device == "mps":
+#    print("  ⚠️  Note: MPS may have stability issues with PPO. Consider using CPU.")
 
 
 # ------------- Rollout Buffer with Teacher Signal -------------

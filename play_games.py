@@ -5,7 +5,6 @@ import flipped_agent as flipped_util
 from utils import (
     one_hot_encoding,
     transformer_one_hot_encoding,
-    transformer_start_token,
     flip_to_pov_plus1,
     _is_empty_move,
     _apply_move_sequence,
@@ -379,7 +378,6 @@ def play_games_batched_transformer(agent_obj, opponent, batch_size=8, training=T
     # Pre-move tokens use actor_flag=0, post-move tokens use actor_flag=1.
     histories293 = [[] for _ in range(batch_size)]
     hist_lens    = [0  for _ in range(batch_size)]
-    history_has_start = [True for _ in range(batch_size)]
 
     # Shorthands
     N    = agent_obj.config.max_seq_len
@@ -388,8 +386,6 @@ def play_games_batched_transformer(agent_obj, opponent, batch_size=8, training=T
 
     # Device for model execution
     device = agent_obj.device if hasattr(agent_obj, "device") else agent_obj.config.device
-
-    start_token_np = transformer_start_token()
 
     def finalize_episode(env_idx):
         nonlocal finished
@@ -401,7 +397,6 @@ def play_games_batched_transformer(agent_obj, opponent, batch_size=8, training=T
             agent_obj._ppo_update()
         histories293[env_idx].clear()
         hist_lens[env_idx] = 0
-        history_has_start[env_idx] = True
         finished += 1
 
     # ---- Initialize games and seed history with initial token ----
@@ -419,7 +414,7 @@ def play_games_batched_transformer(agent_obj, opponent, batch_size=8, training=T
         append_token(
             histories293, hist_lens, i, board_pov, (passes_left[i] > 1),
             lambda b, sr, actor=0.0: transformer_one_hot_encoding(b, sr, actor),
-            max_seq_len=N, start_flags=history_has_start
+            max_seq_len=N
         )
 
     # ---- Main loop ----
@@ -459,7 +454,7 @@ def play_games_batched_transformer(agent_obj, opponent, batch_size=8, training=T
                 append_token(
                     histories293, hist_lens, idx, board_pov, (moves_left > 1),
                     lambda b, sr, actor=0.0: transformer_one_hot_encoding(b, sr, actor),
-                    max_seq_len=N, start_flags=history_has_start
+                    max_seq_len=N
                 )
 
                 cand_feats = np.zeros((Amax, D), dtype=np.float32)
@@ -485,7 +480,7 @@ def play_games_batched_transformer(agent_obj, opponent, batch_size=8, training=T
                 per_env_candidates.append((idx, pmoves_cur, pboards_cur, board_pov, after_np, board_snapshot, dice_snapshot))
 
                 seq_pad, seq_len = pad_truncate_seq(
-                    histories293[idx], N, D, start_token_np, history_has_start[idx]
+                    histories293[idx], N, D
                 )
                 seq_batch.append(seq_pad)
                 seq_len_batch.append(seq_len)
@@ -548,13 +543,13 @@ def play_games_batched_transformer(agent_obj, opponent, batch_size=8, training=T
                     histories293, hist_lens, idx,
                     flip_to_pov_plus1(boards[idx], 1), False,
                     lambda b, sr, actor=1.0: transformer_one_hot_encoding(b, sr, actor),
-                    max_seq_len=N, start_flags=history_has_start
+                    max_seq_len=N
                 )
 
                 # Push transformer tuple to per-env rollout (training only)
                 if training and not agent_obj.eval_mode:
                     seq_padded_np, seq_len = pad_truncate_seq(
-                        histories293[idx], N, D, start_token_np, history_has_start[idx]
+                        histories293[idx], N, D
                     )
                     value = values[row].item() if hasattr(values[row], 'item') else float(values[row])
                     cand_np = batch_cand_states[row]
@@ -607,7 +602,7 @@ def play_games_batched_transformer(agent_obj, opponent, batch_size=8, training=T
                         histories293, hist_lens, idx,
                         flip_to_pov_plus1(board, -1), (moves_left > 1),
                         lambda b, sr, actor=0.0: transformer_one_hot_encoding(b, sr, actor),
-                        max_seq_len=N, start_flags=history_has_start
+                        max_seq_len=N
                     )
 
                     cand_feats = np.zeros((Amax, D), dtype=np.float32)
@@ -632,7 +627,7 @@ def play_games_batched_transformer(agent_obj, opponent, batch_size=8, training=T
                 hist_len = []
                 for idx, _, _ in env_refs:
                     seq_np, seq_len = pad_truncate_seq(
-                        histories293[idx], N, D, start_token_np, history_has_start[idx]
+                        histories293[idx], N, D
                     )
                     hist_batch.append(seq_np)
                     hist_len.append(seq_len)
@@ -653,7 +648,7 @@ def play_games_batched_transformer(agent_obj, opponent, batch_size=8, training=T
                         histories293, hist_lens, idx,
                         flip_to_pov_plus1(boards[idx], -1), False,
                         lambda b, sr, actor=1.0: transformer_one_hot_encoding(b, sr, actor),
-                        max_seq_len=N, start_flags=history_has_start
+                        max_seq_len=N
                     )
 
                     if backgammon.game_over(boards[idx]):
@@ -664,7 +659,7 @@ def play_games_batched_transformer(agent_obj, opponent, batch_size=8, training=T
                                 per_env_rollouts[idx][-1] = (SEQ_, SEQL_, C_, M_, A_, LP_, V_, R_ + loss_reward, 1.0, T_)
                             else:
                                 seq_padded_np, seq_len = pad_truncate_seq(
-                                    histories293[idx], N, D, start_token_np, history_has_start[idx]
+                                    histories293[idx], N, D
                                 )
                                 C_feats = np.zeros((Amax, D), dtype=np.float32)
                                 C_feats[0] = seq_padded_np[max(0, seq_len - 1)]
@@ -700,7 +695,7 @@ def play_games_batched_transformer(agent_obj, opponent, batch_size=8, training=T
                         histories293, hist_lens, idx,
                         flip_to_pov_plus1(boards[idx], -1), False,
                         lambda b, sr, actor=1.0: transformer_one_hot_encoding(b, sr, actor),
-                        max_seq_len=N, start_flags=history_has_start
+                        max_seq_len=N
                     )
 
                     if backgammon.game_over(boards[idx]):
@@ -711,7 +706,7 @@ def play_games_batched_transformer(agent_obj, opponent, batch_size=8, training=T
                                 per_env_rollouts[idx][-1] = (SEQ_, SEQL_, C_, M_, A_, LP_, V_, R_ + loss_reward, 1.0, T_)
                             else:
                                 seq_padded_np, seq_len = pad_truncate_seq(
-                                    histories293[idx], N, D, start_token_np, history_has_start[idx]
+                                    histories293[idx], N, D
                                 )
                                 C_feats = np.zeros((Amax, D), dtype=np.float32)
                                 C_feats[0] = seq_padded_np[max(0, seq_len - 1)]

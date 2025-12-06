@@ -147,14 +147,6 @@ def transformer_one_hot_encoding_torch(board29_t, nSecondRoll, actor_flag):
     start_tensor = torch.zeros_like(actor_tensor)
     return torch.cat([base, actor_tensor, start_tensor], dim=-1)
 
-def transformer_start_token():
-    """Return a numpy start-of-game token."""
-    token = np.zeros(TRANSFORMER_STATE_DIM, dtype=np.float32)
-    token[-2] = 0.0
-    token[-1] = 1.0
-    return token
-
-
 # --- Checkpoint helpers ---
 def _ensure_dir(path: Path) -> bool:
     """Verify directory is writable, create if needed."""
@@ -274,7 +266,7 @@ def flip_to_pov_plus1(board: np.ndarray, player: int) -> np.ndarray:
     return out
 
 def append_token(histories293, hist_lens, idx, board29, nSecondRoll_flag, one_hot_encoding_fn,
-                 max_seq_len=None, start_flags=None):
+                 max_seq_len=None):
     """Append (and optionally truncate) a tokenized observation to an env history."""
     token = one_hot_encoding_fn(board29.astype(np.float32), nSecondRoll_flag)
     if hist_lens[idx] == 0 or not np.array_equal(histories293[idx][-1], token):
@@ -285,17 +277,10 @@ def append_token(histories293, hist_lens, idx, board29, nSecondRoll_flag, one_ho
         return False
 
     removed = False
-    limit = max_seq_len
-    if start_flags is not None and start_flags[idx]:
-        limit = max(1, max_seq_len - 1)
-
-    while hist_lens[idx] > limit:
+    while hist_lens[idx] > max_seq_len:
         del histories293[idx][0]
         hist_lens[idx] -= 1
         removed = True
-        if start_flags is not None and start_flags[idx]:
-            start_flags[idx] = False
-            limit = max_seq_len
 
     return removed
 
@@ -314,20 +299,16 @@ def append_token_torch(histories293, hist_lens, idx, board29, nSecondRoll_flag, 
                 hist_lens[idx] = max_seq_len
 
 
-def pad_truncate_seq(seq_list, max_seq_len, state_dim, start_token=None, has_start=False):
+def pad_truncate_seq(seq_list, max_seq_len, state_dim):
     """
-    Pad or truncate a list of tokens (optionally prefixed with a learnable start token).
+    Pad or truncate a list of tokens to the most recent `max_seq_len` entries.
 
     Args:
         seq_list: list[np.ndarray] — tokenized state history.
         max_seq_len: int — maximum sequence length.
         state_dim: int — feature dimension per token.
-        start_token: optional np.ndarray(state_dim,) representing start sentinel.
-        has_start: bool — whether the episode still includes the start token.
     """
     tokens = seq_list
-    if has_start and start_token is not None:
-        tokens = [start_token] + tokens
     L = len(tokens)
     take = min(L, max_seq_len)
     seq_padded = np.zeros((max_seq_len, state_dim), dtype=np.float32)
