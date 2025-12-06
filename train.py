@@ -43,7 +43,7 @@ from utils import (
     _is_empty_move, _apply_move_sequence,
     flip_to_pov_plus1, get_device
 )
-from play_games import play_games_batched, play_games_batched_transformer
+from play_games import play_games_batched, play_games_batched_transformer, play_one_game
 from evaluate import evaluate, CheckpointLeague
 
 # Set seeds for reproducibility
@@ -310,14 +310,42 @@ def print_elo_standings(state: TrainingState, max_entries: int = 10):
     print(f"{'-'*70}")
     print("ELO RATINGS")
     print(f"{'-'*70}")
-    count = 0
-    for player_id, rating, games in rankings:
-        profile = state.opponent_profiles.get(player_id)
-        label = profile.label if profile else player_id
-        print(f"  {label:<24}  {rating:7.1f}  ({games} games)")
-        count += 1
-        if count >= max_entries:
+    agent_id = state.current_agent_id
+    forced_ids = [agent_id, 'random']
+    printed = 0
+
+    def _print_entry(pid, rating, games, prefix=" "):
+        nonlocal printed
+        profile = state.opponent_profiles.get(pid)
+        label = profile.label if profile else pid
+        print(f"{prefix}{label:<24}  {rating:7.1f}  ({games} games)")
+        printed += 1
+
+    for fid in forced_ids:
+        entry = next((item for item in rankings if item[0] == fid), None)
+        if entry:
+            prefix = '*> ' if fid == agent_id else ' R '
+            _print_entry(entry[0], entry[1], entry[2], prefix=prefix)
+
+    others = [item for item in rankings if item[0] not in forced_ids]
+    others.sort(key=lambda item: item[1], reverse=True)
+
+    # First print opponents with recorded games
+    for pid, rating, games in others:
+        if printed >= max_entries:
             break
+        if games <= 0:
+            continue
+        _print_entry(pid, rating, games)
+
+    # Fill remaining slots with zero-game profiles (if any)
+    if printed < max_entries:
+        for pid, rating, games in others:
+            if printed >= max_entries:
+                break
+            if games > 0:
+                continue
+            _print_entry(pid, rating, games)
     print(f"{'-'*70}")
 
 
@@ -331,6 +359,59 @@ def compute_pool_weight_multiplier(state: TrainingState) -> float:
     ramp = (state.games_done - state.pool_start_games) / max(1, (state.pool_ramp_end - state.pool_start_games))
     scaled_target = max(0.0, min(1.0, state.pool_target_rate))
     return max(0.0, min(1.0, ramp)) * scaled_target
+
+
+def calibrate_opponent_elos(state: TrainingState, games_per_pair: int = 4, max_pool_opponents: int = 3):
+    if games_per_pair <= 0:
+        return 0
+    pool_profiles = [p for p in state.opponent_profiles.values() if p.source == 'pool']
+    pool_profiles.sort(key=lambda p: (p.snapshot_id or 0), reverse=True)
+    selected_ids = []
+    # Always include key opponents if available
+    for key in ('pubeval', 'gnubg', 'random', 'best_checkpoint'):
+        if key in state.opponent_profiles:
+            selected_ids.append(key)
+    for profile in pool_profiles[:max_pool_opponents]:
+        selected_ids.append(profile.opponent_id)
+
+    unique_ids = []
+    for oid in selected_ids:
+        if oid not in unique_ids and oid in state.opponent_profiles:
+            unique_ids.append(oid)
+
+    if len(unique_ids) < 2:
+        return 0
+
+    opponents = []
+    for oid in unique_ids:
+        profile = state.opponent_profiles.get(oid)
+        if not profile:
+            continue
+        opponent = instantiate_opponent(state, profile)
+        if opponent is None or opponent is state.agent_instance:
+            continue
+        if hasattr(opponent, 'set_eval_mode'):
+            opponent.set_eval_mode(True)
+        opponents.append((oid, opponent))
+        touch_cached_opponent(state, oid)
+
+    from itertools import combinations
+    total_games = 0
+    for (id_a, opp_a), (id_b, opp_b) in combinations(opponents, 2):
+        games = max(2, games_per_pair)
+        for _ in range(games // 2):
+            winner, _ = play_one_game(opp_a, opp_b, training=False)
+            if winner == 1:
+                state.elo_tracker.record_match(id_a, id_b, 1.0)
+            elif winner == -1:
+                state.elo_tracker.record_match(id_a, id_b, 0.0)
+            winner, _ = play_one_game(opp_b, opp_a, training=False)
+            if winner == 1:
+                state.elo_tracker.record_match(id_b, id_a, 1.0)
+            elif winner == -1:
+                state.elo_tracker.record_match(id_b, id_a, 0.0)
+            total_games += 2
+    return total_games
 
 
 def _pool_snapshot_exists(state: TrainingState, snapshot_id: int) -> bool:
@@ -832,15 +913,22 @@ def train_step(state: TrainingState, train_bar: tqdm):
     recent_total = len(state.recent_opponents)
     counts = state.recent_counts if recent_total > 0 else state.opponent_stats
     denom = recent_total if recent_total > 0 else sum(state.opponent_stats.values())
+    freq_pairs = []
     if denom > 0:
-        postfix_items.append(("self%", f"{100.0 * counts.get('self_play', 0) / denom:.0f}"))
-        postfix_items.append(("pool%", f"{100.0 * counts.get('pool', 0) / denom:.0f}"))
-        postfix_items.append(("best%", f"{100.0 * counts.get('pool_best', 0) / denom:.0f}"))
-        postfix_items.append(("gnu%", f"{100.0 * counts.get('gnubg', 0) / denom:.0f}"))
-        postfix_items.append(("pub%", f"{100.0 * counts.get('pubeval', 0) / denom:.0f}"))
-        postfix_items.append(("rnd%", f"{100.0 * counts.get('random', 0) / denom:.0f}"))
-        postfix_items.append(("freqN", recent_total if recent_total > 0 else denom))
-        postfix_items.append(("freqSrc", "recent" if recent_total > 0 else "total"))
+        postfix_items.extend([
+            ("self%", f"{100.0 * counts.get('self_play', 0) / denom:.0f}"),
+            ("pool%", f"{100.0 * counts.get('pool', 0) / denom:.0f}"),
+            ("best%", f"{100.0 * counts.get('pool_best', 0) / denom:.0f}"),
+            ("gnu%", f"{100.0 * counts.get('gnubg', 0) / denom:.0f}"),
+            ("pub%", f"{100.0 * counts.get('pubeval', 0) / denom:.0f}"),
+            ("rnd%", f"{100.0 * counts.get('random', 0) / denom:.0f}")
+        ])
+        freq_pairs = [
+            ("freqN", recent_total if recent_total > 0 else denom),
+            ("freqSrc", "recent" if recent_total > 0 else "total")
+        ]
+
+    postfix_items.extend(freq_pairs)
 
     train_bar.set_postfix(OrderedDict(postfix_items))
 
@@ -915,8 +1003,12 @@ def validation_step(state: TrainingState):
     while state.games_done >= state.next_eval_at and state.next_eval_at >= 0:
         ran_eval = True
         print()
+        print("[Eval] Calibrating opponent ELOs...")
+        calib_games = calibrate_opponent_elos(state)
+        if calib_games:
+            print(f"[Eval] Played {calib_games} calibration games between opponents.")
         ai.set_eval_mode(True)
-        
+
         # Save latest checkpoint
         ai.save(str(state.latest_ckpt_path))
         print("[Eval] Agent in EVAL mode")
