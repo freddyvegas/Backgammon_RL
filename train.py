@@ -6,7 +6,7 @@ Unified Training Script for PPO / Micro-A2C
 Supports:
 - Algorithms: PPO, Micro-A2C
 - Model sizes: small / medium / large
-- Agent types for PPO: MLP / transformer
+- Agent types for PPO: MLP / CNN / transformer
 """
 
 import numpy as np
@@ -33,6 +33,7 @@ import flipped_agent as flipped_util
 import gnu_backgammon_player as gnubg_player
 
 import ppo_agent as ppo_agent
+import ppo_conv_agent as conv_agent
 import ppo_transformer_agent as transformer_agent
 import a2c_micro_agent as a2c_agent
 import agent_td_lambda_baseline as baseline_agent
@@ -61,8 +62,16 @@ CHECKPOINT_DIR = "./checkpoints"
 def resolve_agent_module(algo: str, agent_type: str):
     """Return (module_name, class_name) for initializing opponents/checkpoints."""
     if algo == "ppo":
-        module = "ppo_transformer_agent" if agent_type == "transformer" else "ppo_agent"
-        cls_name = "PPOAgent"
+        agent_key = (agent_type or 'mlp').lower()
+        if agent_key == "transformer":
+            module = "ppo_transformer_agent"
+            cls_name = "PPOAgent"
+        elif agent_key == "cnn":
+            module = "ppo_conv_agent"
+            cls_name = "PPOConvAgent"
+        else:
+            module = "ppo_agent"
+            cls_name = "PPOAgent"
     elif algo == "baseline-td":
         module = "agent_td_lambda_baseline"
         cls_name = "TDLambdaAgent"
@@ -151,7 +160,7 @@ class TrainingState:
     league_checkpoint_every: int
     n_eval_league: int
     timestamp: str
-    agent_type: str           # "MLP" or "transformer" (PPO only, ignored for A2C)
+    agent_type: str           # "mlp", "cnn", or "transformer" (PPO only, ignored for A2C)
     agent_module_name: str
     agent_class_name: str
     ckpt_tag: str
@@ -547,7 +556,8 @@ def initialize_training(
     algo = algo.lower()
     if algo not in ("ppo", "micro-a2c", "baseline-td"):
         raise ValueError(f"Unsupported algo '{algo}', use 'ppo' or 'micro-a2c', or 'baseline-td'.")
-    agent_module_name, agent_class_name = resolve_agent_module(algo, agent_type)
+    agent_type_key = (agent_type or 'mlp').lower()
+    agent_module_name, agent_class_name = resolve_agent_module(algo, agent_type_key)
 
     print("\n" + "=" * 70)
     print(f"{'PPO' if algo == 'ppo' else 'MICRO-A2C'} TRAINING")
@@ -561,7 +571,7 @@ def initialize_training(
     print(f"Lookahead: {use_eval_lookahead} (k={eval_lookahead_k})")
     print(f"Device: {device}")
     if algo == "ppo":
-        print(f"Agent type: {agent_type}")
+        print(f"Agent type: {agent_type_key.upper()}")
     teacher_module = None
     teacher = (teacher or 'pubeval').lower()
     if algo == 'ppo':
@@ -584,9 +594,17 @@ def initialize_training(
 
     # -------- Agent instantiation --------
     if algo == "ppo":
-        if agent_type == 'transformer':
+        if agent_type_key == 'transformer':
             cfg = transformer_agent.get_config(model_size)
             agent_instance = transformer_agent.PPOAgent(
+                config=cfg,
+                device=device,
+                teacher_mode=teacher,
+                teacher_module=teacher_module
+            )
+        elif agent_type_key == 'cnn':
+            cfg = conv_agent.get_config(model_size)
+            agent_instance = conv_agent.PPOConvAgent(
                 config=cfg,
                 device=device,
                 teacher_mode=teacher,
@@ -622,7 +640,12 @@ def initialize_training(
 
     # Use different prefixes for PPO vs A2C vs Baseline
     if algo == "ppo":
-        ckpt_tag = "ppo_transformer" if agent_type.lower() == "transformer" else "ppo"
+        if agent_type_key == "transformer":
+            ckpt_tag = "ppo_transformer"
+        elif agent_type_key == "cnn":
+            ckpt_tag = "ppo_cnn"
+        else:
+            ckpt_tag = "ppo"
     elif algo == "baseline-td":
         ckpt_tag = "baseline_td"
     else:
@@ -630,7 +653,12 @@ def initialize_training(
 
     if algo == "ppo":
         # Keep PPO's global CHECKPOINT_PATH behavior
-        ppo_module = transformer_agent if agent_type == 'transformer' else ppo_agent
+        if agent_type_key == 'transformer':
+            ppo_module = transformer_agent
+        elif agent_type_key == 'cnn':
+            ppo_module = conv_agent
+        else:
+            ppo_module = ppo_agent
         ppo_module.CHECKPOINT_PATH = checkpoint_base_path / f"best_{ckpt_tag}_{model_size}_{timestamp}.pt"
     elif algo == "baseline-td":
         baseline_agent.CHECKPOINT_PATH = checkpoint_base_path / f"best_{ckpt_tag}_{model_size}_{timestamp}.pt"
@@ -648,6 +676,7 @@ def initialize_training(
         opponent_pool = OpponentPool(
             pool_dir=pool_dir,
             agent_module_name=agent_module_name,
+            agent_class_name=agent_class_name,
             max_size=pool_max_size,
             seed=RANDOM_SEED,
             device=device,
@@ -716,7 +745,7 @@ def initialize_training(
         league_checkpoint_every=league_checkpoint_every,
         n_eval_league=n_eval_league,
         timestamp=timestamp,
-        agent_type=agent_type,
+        agent_type=agent_type_key,
         agent_module_name=agent_module_name,
         agent_class_name=agent_class_name,
         ckpt_tag=ckpt_tag,
@@ -1249,7 +1278,7 @@ if __name__ == "__main__":
     parser.add_argument('--device', type=str, default='cpu',
                         help='Device type to train on (e.g. cpu, cuda, mps)')
     parser.add_argument('--agent-type', type=str, default='MLP',
-                        help='PPO agent type: MLP or transformer')
+                        help='PPO agent type: MLP, CNN, or transformer')
     parser.add_argument('--resume', type=Path, default=None,
                         help='Path to a .pt checkpoint to resume training from')
     parser.add_argument('--teacher', type=str, default='pubeval',

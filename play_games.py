@@ -45,7 +45,21 @@ def play_games_batched(agent_obj, opponent, batch_size=8, training=True, train_c
     
     # Detect agent type once at the start
     is_ppo_like = hasattr(agent_obj, "batch_score") and hasattr(agent_obj, "buffer") and hasattr(agent_obj.config, "max_actions")
-    
+    cfg = getattr(agent_obj, 'config', None)
+    use_raw_board_inputs = bool(getattr(cfg, 'use_raw_board_inputs', False)) if cfg else False
+    raw_board_dim = getattr(cfg, 'raw_board_dim', 29) if cfg else 29
+    state_dim = getattr(cfg, 'state_dim', raw_board_dim) if cfg else 293
+    flag_index = getattr(cfg, 'second_roll_index', raw_board_dim) if cfg else raw_board_dim
+
+    def encode_state_features(board_vec, second_roll_flag):
+        if use_raw_board_inputs:
+            feats = np.zeros(state_dim, dtype=np.float32)
+            feats[:raw_board_dim] = board_vec.astype(np.float32)
+            idx = min(flag_index, state_dim - 1)
+            feats[idx] = 1.0 if second_roll_flag else 0.0
+            return feats
+        return one_hot_encoding(board_vec.astype(np.float32), second_roll_flag)
+
     # Keep trajectories per environment (PPO only)
     if is_ppo_like:
         per_env_rollouts = [[] for _ in range(batch_size)]
@@ -111,7 +125,7 @@ def play_games_batched(agent_obj, opponent, batch_size=8, training=True, train_c
                 moves_left = passes_left[idx]            # 1 (normal) or 2 (first move of doubles)
                 S29 = board_pov.astype(np.float32)
                 nSecondRoll_now = (moves_left > 1)
-                S_feat = one_hot_encoding(S29, nSecondRoll_now)   # shape (nx,)
+                S_feat = encode_state_features(S29, nSecondRoll_now)
 
                 # Build candidates (now state_dim wide)
                 cand_feats = np.zeros(
@@ -127,7 +141,7 @@ def play_games_batched(agent_obj, opponent, batch_size=8, training=True, train_c
                 for a in range(nA):
                     after29 = flip_to_pov_plus1(pboards_cur[a], 1)
                     nSecondRoll_next = (passes_left[idx] - 1) > 1
-                    cand_feats[a]  = one_hot_encoding(after29, nSecondRoll_next)
+                    cand_feats[a]  = encode_state_features(after29, nSecondRoll_next)
                     raw_after_states.append(after29.astype(np.float32))
                     mask[a] = 1.0
 
@@ -316,7 +330,7 @@ def play_games_batched(agent_obj, opponent, batch_size=8, training=True, train_c
                         else:
                             # Rare: agent never acted - fabricate a 1-step terminal sample
                             board_pov29 = flip_to_pov_plus1(boards[idx], 1).astype(np.float32)
-                            S_feat = one_hot_encoding(board_pov29, False)
+                            S_feat = encode_state_features(board_pov29, False)
                             C_feats = np.zeros((agent_obj.config.max_actions, agent_obj.config.state_dim), dtype=np.float32)
                             C_feats[0] = S_feat
                             M = np.zeros(agent_obj.config.max_actions, dtype=np.float32)

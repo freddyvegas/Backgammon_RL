@@ -42,6 +42,7 @@ class OpponentPool:
     """
 
     def __init__(self, pool_dir: Path, agent_module_name: str = "ppo_agent",
+                 agent_class_name: str = "PPOAgent",
                  max_size: int = 12, seed: int = 42, device: str = None,
                  ctor_kwargs: dict = None, config_template=None):
         """
@@ -55,6 +56,7 @@ class OpponentPool:
         self.pool_dir = Path(pool_dir)
         self.pool_dir.mkdir(parents=True, exist_ok=True)
         self.agent_module_name = agent_module_name
+        self.agent_class_name = agent_class_name or "PPOAgent"
         self.max_size = max_size
         self.snapshots = []  # list[(path: Path, snapshot_id: int)]
         self._snapshot_counter = 0
@@ -80,13 +82,16 @@ class OpponentPool:
 
     def _load_opponent_from_path(self, snapshot_path: Path, snapshot_id: int):
         agent_mod = importlib.import_module(self.agent_module_name)
+        AgentCls = getattr(agent_mod, self.agent_class_name, None)
+        if AgentCls is None:
+            raise AttributeError(f"module '{self.agent_module_name}' has no attribute '{self.agent_class_name}'")
         kwargs = dict(self.ctor_kwargs)
         if self.config_template is not None:
             kwargs['config'] = copy.deepcopy(self.config_template)
         try:
-            opponent = agent_mod.PPOAgent(**kwargs)
+            opponent = AgentCls(**kwargs)
         except TypeError:
-            opponent = agent_mod.PPOAgent()
+            opponent = AgentCls()
         opponent.load(str(snapshot_path), map_location=self.device, load_optimizer=False)
         opponent.set_eval_mode(True)
         opponent._opponent_id = f"pool_{snapshot_id}"
