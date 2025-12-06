@@ -953,7 +953,10 @@ class PPOAgent:
                 mb_oldv = old_values_t[mb]
                 mb_teacher = teacher_indices_t[mb]
 
-                autocast_ctx = torch.cuda.amp.autocast(enabled=self.amp_enabled) if self.amp_enabled else nullcontext()
+                if self.amp_enabled:
+                    autocast_ctx = torch.amp.autocast(device_type='cuda', enabled=True)
+                else:
+                    autocast_ctx = nullcontext()
                 with autocast_ctx:
                     logits, value_preds = self.acnet(mb_seq, mb_len, mb_cand, mb_mask)
 
