@@ -317,6 +317,8 @@ def print_elo_standings(state: TrainingState, max_entries: int = 10):
     def _print_entry(pid, rating, games, prefix=" "):
         nonlocal printed
         profile = state.opponent_profiles.get(pid)
+        if profile and profile.source == 'self_play':
+            return
         label = profile.label if profile else pid
         print(f"{prefix}{label:<24}  {rating:7.1f}  ({games} games)")
         printed += 1
