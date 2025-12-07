@@ -593,6 +593,87 @@ class PPOAgent:
         """Return 293-dim one-hot features (net input)."""
         return one_hot_encoding(board29.astype(np.float32), bool(moves_left > 1))
 
+    def _encode_batch(self, boards29: list, moves_left: int = 0):
+        """Encode a list of +1 POV boards into a batched tensor."""
+        if not boards29:
+            raise ValueError("Cannot encode empty board batch for lookahead")
+        encoded_list = [self._encode_state(board, moves_left) for board in boards29]
+        encoded_np = np.stack(encoded_list, axis=0).astype(np.float32)
+        return torch.as_tensor(encoded_np, dtype=torch.float32, device=self.device)
+
+    @torch.no_grad()
+    def _evaluate_moves_lookahead(self, possible_boards: list, player: int):
+        """
+        Evaluate candidate moves via 1-ply expectiminimax using a single,
+        massive batch for all opponent after-states across all candidate moves.
+        """
+        if not possible_boards:
+            return torch.empty(0, device=self.device)
+
+        dice_rolls = [
+            (1, 1), (2, 2), (3, 3), (4, 4), (5, 5), (6, 6),
+            (1, 2), (1, 3), (1, 4), (1, 5), (1, 6), (2, 3), (2, 4), (2, 5), (2, 6),
+            (3, 4), (3, 5), (3, 6), (4, 5), (4, 6), (5, 6)
+        ]
+        dice_weights = np.array([1 if a == b else 2 for (a, b) in dice_rolls], dtype=np.float32) / 36.0
+
+        # --- PASS 1: Collection ---
+        # Collect all opponent after-states from ALL candidate moves into ONE list.
+        all_opp_states = []
+        
+        # Map to link the sliced results back to the original (my_move_idx, dice_roll_idx)
+        move_roll_map = [] 
+        
+        # Cache for the value of the board *after* my move (V(s') from my POV)
+        my_board_values = [] 
+
+        for my_move_idx, board_after_my_move in enumerate(possible_boards):
+            board_opp_pov = _flip_board(board_after_my_move)
+            
+            # 1. Cache the raw 0-ply value of the resulting board (used if opponent has no move)
+            encoded_my_board = self._encode_batch([board_after_my_move])
+            my_board_values.append(self.acnet.value(encoded_my_board).item())
+            
+            # 2. Collect opponent states
+            for dice_roll_idx, dice in enumerate(dice_rolls):
+                _, opp_boards = backgammon.legal_moves(board_opp_pov, dice, player=1)
+                
+                start_idx = len(all_opp_states)
+                if opp_boards:
+                    all_opp_states.extend(opp_boards)
+                    
+                end_idx = len(all_opp_states)
+                move_roll_map.append((my_move_idx, dice_roll_idx, start_idx, end_idx))
+
+        # --- PASS 2: Single Network Evaluation ---
+        if not all_opp_states:
+            # If no moves exist anywhere, return raw board values
+            return torch.tensor(my_board_values, dtype=torch.float32, device=self.device)
+
+        # ONE single, massive forward pass on the GPU for ALL opponent states
+        opp_encoded = self._encode_batch(all_opp_states, moves_left=0)
+        all_opp_vals = self.acnet.value(opp_encoded)
+        
+        # --- PASS 3: Aggregation ---
+        final_move_values = [0.0] * len(possible_boards)
+
+        for my_move_idx, dice_roll_idx, start_idx, end_idx in move_roll_map:
+            weight = dice_weights[dice_roll_idx]
+            
+            if start_idx == end_idx:
+                # Opponent cannot move; use the cached raw value of my board
+                my_val = my_board_values[my_move_idx]
+            else:
+                # Minimax step: Opponent chooses max(V_opp), our value is -max(V_opp)
+                batch_vals = all_opp_vals[start_idx:end_idx]
+                best_reply_val = torch.max(batch_vals).item()
+                my_val = -best_reply_val
+                
+            # Expectation step: Add weighted value to the total
+            final_move_values[my_move_idx] += my_val * float(weight)
+
+        return torch.tensor(final_move_values, dtype=torch.float32, device=self.device)
+
     def _compute_shaped_reward(self, board_before, board_after):
         """Compute shaped reward (DISABLED by default)."""
         if not self.config.use_reward_shaping:
@@ -1111,15 +1192,29 @@ class PPOAgent:
         deltas = cand_states - S
         mask = np.ones(nA, dtype=np.float32)
 
-        # Convert to tensors
+        # Convert to tensors for default scoring
         S_t = torch.as_tensor(S[None, :], dtype=torch.float32, device=self.device)
         deltas_t = torch.as_tensor(deltas[None, :, :], dtype=torch.float32, device=self.device)
         mask_t = torch.as_tensor(mask[None, :], dtype=torch.float32, device=self.device)
 
-        with torch.no_grad():
-            logits, value_t = self.acnet(S_t, deltas_t, mask_t)
-            logits = logits.squeeze(0)
-            value = value_t.item()
+        lookahead_settings = train_config if isinstance(train_config, dict) else {}
+        use_la = bool(lookahead_settings.get('use_lookahead', False))
+        la_depth = int(lookahead_settings.get('lookahead_k', 1) or 1)
+
+        if (not train or self.eval_mode) and use_la and la_depth >= 1:
+            if la_depth == 1:
+                logits = self._evaluate_moves_lookahead(possible_boards, player)
+                value = torch.max(logits).item() if logits.numel() > 0 else 0.0
+            else:
+                with torch.no_grad():
+                    logits0, value_t = self.acnet(S_t, deltas_t, mask_t)
+                    logits = logits0.squeeze(0)
+                    value = value_t.item()
+        else:
+            with torch.no_grad():
+                logits, value_t = self.acnet(S_t, deltas_t, mask_t)
+                logits = logits.squeeze(0)
+                value = value_t.item()
 
         # Action selection
         if train and not self.eval_mode:
