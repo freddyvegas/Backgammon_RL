@@ -1178,7 +1178,7 @@ def train(
     label_baseline = f"vs {baseline_label}:"
     label_random = "vs Random:"
     print(f"  {label_primary:<16}{state.perf_data['vs_gnubg'][-1]:.1f}%  ⭐ PRIMARY")
-    print(f"  {label_baseline:<16}{state.perf_data['vs_baseline'][-1]:.1f}%")
+    print(f"  {label_baseline:<16}{state.perf_data['vs_pubeval'][-1]:.1f}%")
     print(f"  {label_random:<16}{state.perf_data['vs_random'][-1]:.1f}%")
 
     ai = state.agent_instance

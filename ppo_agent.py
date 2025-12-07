@@ -93,7 +93,7 @@ class Config:
     teacher_sample_rate = 0.10    # Sample teacher label 10% of time
     teacher_loss_coef_start = 0.05  # Initial teacher loss coefficient
     teacher_loss_coef_end = 0.0     # Final teacher loss coefficient (decay to 0)
-    teacher_decay_horizon = 2_000_000  # 50,000 games * 40 steps/game
+    teacher_decay_horizon = 4_000_000  # 100,000 games * 40 steps/game
 
     # Learning-rate schedule (warmup + cosine decay)
     lr_warmup_ratio = 0.01
