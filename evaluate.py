@@ -1,4 +1,4 @@
-
+from tqdm import tqdm
 from pathlib import Path
 from play_games import play_one_game
 
@@ -11,7 +11,7 @@ def evaluate(agent_mod, evaluation_agent, n_eval, label="", debug_sides=False,
     games_as_p1 = 0
     games_as_p2 = 0
 
-    for g in range(n_eval):
+    for g in tqdm(range(n_eval)):
         # Agent 1 plays as player 1
         winner, _ = play_one_game(agent_mod, evaluation_agent, training=False,
                                   use_lookahead=use_lookahead, lookahead_k=lookahead_k)
