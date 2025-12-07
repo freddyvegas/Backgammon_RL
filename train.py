@@ -44,7 +44,7 @@ from utils import (
     _is_empty_move, _apply_move_sequence,
     flip_to_pov_plus1, get_device
 )
-from play_games import play_games_batched, play_games_batched_transformer, play_one_game
+from play_games import play_games_batched, play_games_batched_transformer, play_one_game, play_single_game
 from evaluate import evaluate, CheckpointLeague
 
 # Set seeds for reproducibility
@@ -822,59 +822,6 @@ def initialize_training(
 
     return state
 
-
-# =========================
-# One training step
-# =========================
-def play_single_game(agent_obj, opponent, training=True, result_callback=None):
-    """Play a single game for non-batched agents."""
-    board = backgammon.init_board()
-    player = 1
-
-    if hasattr(agent_obj, 'episode_start'):
-        agent_obj.episode_start()
-    if hasattr(opponent, 'episode_start'):
-        opponent.episode_start()
-
-    while not backgammon.game_over(board):
-        dice = backgammon.roll_dice()
-        n_moves = 2 if dice[0] == dice[1] else 1
-
-        for i in range(n_moves):
-            if backgammon.game_over(board):
-                break
-
-            if player == 1:
-                move = agent_obj.action(board.copy(), dice, player, i, train=training)
-            else:
-                if hasattr(opponent, 'action'):
-                    move = opponent.action(board.copy(), dice, player, i, train=False)
-                else:
-                    # Module-style opponent (pubeval, random)
-                    board_flipped = flipped_util.flip_board(board.copy())
-                    move = opponent.action(board_flipped, dice, 1, i)
-                    if len(move) > 0:
-                        move = flipped_util.flip_move(move)
-
-            if len(move) > 0:
-                board = backgammon.update_board(board, move, player)
-
-            if backgammon.game_over(board):
-                break
-
-        player = -player
-
-    winner = 1 if board[27] == 15 else -1
-    if callable(result_callback):
-        result_callback(1 if winner == 1 else -1)
-
-    if hasattr(agent_obj, 'end_episode'):
-        agent_obj.end_episode(winner, board, perspective=1)
-    if hasattr(opponent, 'end_episode'):
-        opponent.end_episode(winner, board, perspective=-1)
-
-    return winner
-
 def train_step(state: TrainingState, train_bar: tqdm):
     """Run one batched rollout of complete games and handle pool snapshots if thresholds are crossed."""
     ai = state.agent_instance
@@ -1096,7 +1043,6 @@ def validation_step(state: TrainingState):
         state.perf_data.setdefault('vs_gnubg', []).append(wr_gnubg)
 
         # Evaluate vs configured baseline (secondary)
-        baseline_games = max(50, state.n_eval // 2)
         wr_pubeval = evaluate(
             ai, pubeval, state.n_eval,
             label=f"vs Pubeval",
@@ -1111,7 +1057,7 @@ def validation_step(state: TrainingState):
 
         # Evaluate vs Random (sanity check)
         wr_random = evaluate(
-            ai, randomAgent, max(50, state.n_eval // 2),
+            ai, randomAgent, state.n_eval,
             label="vs Random",
             debug_sides=False,
             use_lookahead=False,
@@ -1164,7 +1110,7 @@ def train(
     algo="ppo",
     n_games=200_000,
     n_epochs=5_000,
-    n_eval=200,
+    n_eval=100,
     eval_vs="pubeval",
     model_size='large',
     use_opponent_pool=True,
@@ -1363,7 +1309,7 @@ if __name__ == "__main__":
             algo=args.algo,
             n_games=args.n_games,
             n_epochs=args.n_epochs,
-            n_eval=200,
+            n_eval=100,
             eval_vs=args.eval_vs,
             model_size=args.model_size,
             use_opponent_pool=True,

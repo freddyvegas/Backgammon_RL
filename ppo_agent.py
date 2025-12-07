@@ -38,7 +38,7 @@ class Config:
     max_actions = 64
 
     # PPO hyperparameters - GENTLER for stability
-    lr = 5e-5              # Gentler default
+    lr = 1e-4              # Gentler default
     gamma = 0.99
     gae_lambda = 0.95
     clip_epsilon = 0.2
@@ -93,7 +93,7 @@ class Config:
     teacher_sample_rate = 0.10    # Sample teacher label 10% of time
     teacher_loss_coef_start = 0.05  # Initial teacher loss coefficient
     teacher_loss_coef_end = 0.0     # Final teacher loss coefficient (decay to 0)
-    teacher_decay_horizon = 50_000  # Decay over this many games
+    teacher_decay_horizon = 2_000_000  # 50,000 games * 40 steps/game
 
     # Learning-rate schedule (warmup + cosine decay)
     lr_warmup_ratio = 0.01
@@ -620,28 +620,28 @@ class PPOAgent:
         # --- PASS 1: Collection ---
         # Collect all opponent after-states from ALL candidate moves into ONE list.
         all_opp_states = []
-        
+
         # Map to link the sliced results back to the original (my_move_idx, dice_roll_idx)
-        move_roll_map = [] 
-        
+        move_roll_map = []
+
         # Cache for the value of the board *after* my move (V(s') from my POV)
-        my_board_values = [] 
+        my_board_values = []
 
         for my_move_idx, board_after_my_move in enumerate(possible_boards):
             board_opp_pov = _flip_board(board_after_my_move)
-            
+
             # 1. Cache the raw 0-ply value of the resulting board (used if opponent has no move)
             encoded_my_board = self._encode_batch([board_after_my_move])
             my_board_values.append(self.acnet.value(encoded_my_board).item())
-            
+
             # 2. Collect opponent states
             for dice_roll_idx, dice in enumerate(dice_rolls):
                 _, opp_boards = backgammon.legal_moves(board_opp_pov, dice, player=1)
-                
+
                 start_idx = len(all_opp_states)
                 if opp_boards:
                     all_opp_states.extend(opp_boards)
-                    
+
                 end_idx = len(all_opp_states)
                 move_roll_map.append((my_move_idx, dice_roll_idx, start_idx, end_idx))
 
@@ -653,13 +653,13 @@ class PPOAgent:
         # ONE single, massive forward pass on the GPU for ALL opponent states
         opp_encoded = self._encode_batch(all_opp_states, moves_left=0)
         all_opp_vals = self.acnet.value(opp_encoded)
-        
+
         # --- PASS 3: Aggregation ---
         final_move_values = [0.0] * len(possible_boards)
 
         for my_move_idx, dice_roll_idx, start_idx, end_idx in move_roll_map:
             weight = dice_weights[dice_roll_idx]
-            
+
             if start_idx == end_idx:
                 # Opponent cannot move; use the cached raw value of my board
                 my_val = my_board_values[my_move_idx]
@@ -668,7 +668,7 @@ class PPOAgent:
                 batch_vals = all_opp_vals[start_idx:end_idx]
                 best_reply_val = torch.max(batch_vals).item()
                 my_val = -best_reply_val
-                
+
             # Expectation step: Add weighted value to the total
             final_move_values[my_move_idx] += my_val * float(weight)
 

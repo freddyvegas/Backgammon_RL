@@ -877,3 +877,56 @@ def play_one_game(agent1, agent2, training=False, commentary=False,
         agent2.end_episode(+1 if winner == -1 else -1, final_board, perspective=-1)
 
     return winner, final_board
+
+
+# =========================
+# One training step
+# =========================
+def play_single_game(agent_obj, opponent, training=True, result_callback=None):
+    """Play a single game for non-batched agents."""
+    board = backgammon.init_board()
+    player = 1
+
+    if hasattr(agent_obj, 'episode_start'):
+        agent_obj.episode_start()
+    if hasattr(opponent, 'episode_start'):
+        opponent.episode_start()
+
+    while not backgammon.game_over(board):
+        dice = backgammon.roll_dice()
+        n_moves = 2 if dice[0] == dice[1] else 1
+
+        for i in range(n_moves):
+            if backgammon.game_over(board):
+                break
+
+            if player == 1:
+                move = agent_obj.action(board.copy(), dice, player, i, train=training)
+            else:
+                if hasattr(opponent, 'action'):
+                    move = opponent.action(board.copy(), dice, player, i, train=False)
+                else:
+                    # Module-style opponent (pubeval, random)
+                    board_flipped = flipped_util.flip_board(board.copy())
+                    move = opponent.action(board_flipped, dice, 1, i)
+                    if len(move) > 0:
+                        move = flipped_util.flip_move(move)
+
+            if len(move) > 0:
+                board = backgammon.update_board(board, move, player)
+
+            if backgammon.game_over(board):
+                break
+
+        player = -player
+
+    winner = 1 if board[27] == 15 else -1
+    if callable(result_callback):
+        result_callback(1 if winner == 1 else -1)
+
+    if hasattr(agent_obj, 'end_episode'):
+        agent_obj.end_episode(winner, board, perspective=1)
+    if hasattr(opponent, 'end_episode'):
+        opponent.end_episode(winner, board, perspective=-1)
+
+    return winner
