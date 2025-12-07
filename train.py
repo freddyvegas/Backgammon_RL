@@ -134,6 +134,16 @@ class EloTracker:
             yield pid, rating, self.game_counts.get(pid, 0)
 
 
+def format_opponent_label(name: str) -> str:
+    """Return a nicely formatted opponent label."""
+    mapping = {
+        'pubeval': 'Pubeval',
+        'gnubg': 'GNU BG',
+        'random': 'Random'
+    }
+    return mapping.get(str(name).lower(), str(name).title())
+
+
 # =========================
 # Core training structures
 # =========================
@@ -196,8 +206,7 @@ class TrainingState:
     elo_history: list = field(default_factory=list)
     elo_history_series: dict = field(default_factory=dict)
     perf_data: dict = field(default_factory=lambda: {
-    'vs_baseline': [],
-    'vs_baseline_lookahead': [],
+    'vs_pubeval': [],
     'vs_random': [],
     'vs_gnubg': [],
     'vs_league_avg': [],
@@ -821,20 +830,20 @@ def play_single_game(agent_obj, opponent, training=True, result_callback=None):
     """Play a single game for non-batched agents."""
     board = backgammon.init_board()
     player = 1
-    
+
     if hasattr(agent_obj, 'episode_start'):
         agent_obj.episode_start()
     if hasattr(opponent, 'episode_start'):
         opponent.episode_start()
-    
+
     while not backgammon.game_over(board):
         dice = backgammon.roll_dice()
         n_moves = 2 if dice[0] == dice[1] else 1
-        
+
         for i in range(n_moves):
             if backgammon.game_over(board):
                 break
-            
+
             if player == 1:
                 move = agent_obj.action(board.copy(), dice, player, i, train=training)
             else:
@@ -846,24 +855,24 @@ def play_single_game(agent_obj, opponent, training=True, result_callback=None):
                     move = opponent.action(board_flipped, dice, 1, i)
                     if len(move) > 0:
                         move = flipped_util.flip_move(move)
-            
+
             if len(move) > 0:
                 board = backgammon.update_board(board, move, player)
-            
+
             if backgammon.game_over(board):
                 break
-        
+
         player = -player
-    
+
     winner = 1 if board[27] == 15 else -1
     if callable(result_callback):
         result_callback(1 if winner == 1 else -1)
-    
+
     if hasattr(agent_obj, 'end_episode'):
         agent_obj.end_episode(winner, board, perspective=1)
     if hasattr(opponent, 'end_episode'):
         opponent.end_episode(winner, board, perspective=-1)
-    
+
     return winner
 
 def train_step(state: TrainingState, train_bar: tqdm):
@@ -1068,62 +1077,79 @@ def validation_step(state: TrainingState):
         # Save latest checkpoint
         ai.save(str(state.latest_ckpt_path))
         print("[Eval] Agent in EVAL mode")
-        print(f"\n{'='*70}")
-        print(f"EVALUATION AFTER {state.next_eval_at:,} GAMES")
-        print(f"{'='*70}")
-        
+
+        lookahead_on = state.use_eval_lookahead and hasattr(ai, '_evaluate_moves_lookahead')
+
         # Evaluate vs GNU Backgammon FIRST (primary metric)
         try:
-            wr_gnubg = evaluate(ai, gnubg_player, state.n_eval,  # Use full n_eval for primary metric
-                               label="vs GNU Backgammon",
-                               debug_sides=False, use_lookahead=False)
-            if 'vs_gnubg' not in state.perf_data:
-                state.perf_data['vs_gnubg'] = []
-            state.perf_data['vs_gnubg'].append(wr_gnubg)
+            wr_gnubg = evaluate(
+                ai, gnubg_player, state.n_eval,
+                label="vs GNU Backgammon",
+                debug_sides=False,
+                use_lookahead=lookahead_on,
+                lookahead_k=state.eval_lookahead_k,
+                quiet=True
+            )
         except Exception as e:
             print(f"  ⚠️  GNU BG evaluation failed: {e}")
             wr_gnubg = 0.0
-            if 'vs_gnubg' not in state.perf_data:
-                state.perf_data['vs_gnubg'] = []
-            state.perf_data['vs_gnubg'].append(0.0)
-        
-        # Evaluate vs Pubeval (secondary)
-        wr_pubeval = evaluate(ai, pubeval, max(50, state.n_eval // 2),
-                             label="vs Pubeval",
-                             debug_sides=False, use_lookahead=False)
-        state.perf_data['vs_baseline'].append(wr_pubeval)
-        
+        state.perf_data.setdefault('vs_gnubg', []).append(wr_gnubg)
+
+        # Evaluate vs configured baseline (secondary)
+        baseline_games = max(50, state.n_eval // 2)
+        wr_pubeval = evaluate(
+            ai, pubeval, state.n_eval,
+            label=f"vs Pubeval",
+            debug_sides=False,
+            use_lookahead=lookahead_on,
+            lookahead_k=state.eval_lookahead_k,
+            quiet=True
+        )
+        if lookahead_on:
+            state.perf_data.setdefault('vs_pubeval', []).append(wr_pubeval)
+        state.perf_data['vs_pubeval'].append(wr_pubeval)
+
         # Evaluate vs Random (sanity check)
-        wr_random = evaluate(ai, randomAgent, max(50, state.n_eval // 2),
-                            label="vs Random",
-                            debug_sides=False, use_lookahead=False)
+        wr_random = evaluate(
+            ai, randomAgent, max(50, state.n_eval // 2),
+            label="vs Random",
+            debug_sides=False,
+            use_lookahead=False,
+            lookahead_k=state.eval_lookahead_k,
+            quiet=True
+        )
         state.perf_data['vs_random'].append(wr_random)
-        
-        # Summary
+
+        # Summary block
+        header_suffix = " (lookahead)" if lookahead_on else ""
+        baseline_label = format_opponent_label(state.eval_vs)
         print(f"\n{'='*70}")
-        print(f"EVALUATION SUMMARY")
+        print(f"EVALUATION AFTER {state.next_eval_at:,} GAMES{header_suffix}")
         print(f"{'='*70}")
-        print(f"  vs GNU BG:        {wr_gnubg:5.1f}%  ⭐ PRIMARY")
-        print(f"  vs Pubeval:       {wr_pubeval:5.1f}%")
-        print(f"  vs Random:        {wr_random:5.1f}%")
+        primary_label = "vs GNU BG:"
+        pubeval_label = f"vs Pubeval:"
+        random_label = "vs Random:"
+        print(f"    {primary_label:<16}{wr_gnubg:5.1f}%  ⭐ PRIMARY")
+        print(f"    {pubeval_label:<16}{wr_pubeval:5.1f}%")
+        print(f"    {random_label:<16}{wr_random:5.1f}%")
         print(f"{'='*70}\n")
         print_elo_standings(state)
         record_elo_point(state, state.current_agent_id)
         record_elo_point(state, 'pubeval')
         record_elo_point(state, 'gnubg')
         record_elo_point(state, 'random')
-        
+
         # Check if new best (use GNU BG as primary metric)
         if wr_gnubg > state.best_wr:
             state.best_wr = wr_gnubg
             ai.save(str(state.best_ckpt_path))
             state.cached_opponents.pop('best_checkpoint', None)
             print(f"  🌟 NEW BEST vs GNU BG: {wr_gnubg:.1f}% (saved to {state.best_ckpt_path.name})")
-        
+
         # Warning checks
         if wr_random < 60.0:
             print(f"  ⚠️  WARNING: Only {wr_random:.1f}% vs random!")
-        
+
         ai.set_eval_mode(False)
         state.next_eval_at += state.n_epochs
 
@@ -1201,9 +1227,13 @@ def train(
 
     print()
     print(f"Final Performance Summary:")
-    print(f"  vs GNU BG:   {state.perf_data['vs_gnubg'][-1]:.1f}%  ⭐ PRIMARY")
-    print(f"  vs Pubeval:  {state.perf_data['vs_baseline'][-1]:.1f}%")
-    print(f"  vs Random:   {state.perf_data['vs_random'][-1]:.1f}%")
+    baseline_label = format_opponent_label(state.eval_vs)
+    label_primary = "vs GNU BG:"
+    label_baseline = f"vs {baseline_label}:"
+    label_random = "vs Random:"
+    print(f"  {label_primary:<16}{state.perf_data['vs_gnubg'][-1]:.1f}%  ⭐ PRIMARY")
+    print(f"  {label_baseline:<16}{state.perf_data['vs_baseline'][-1]:.1f}%")
+    print(f"  {label_random:<16}{state.perf_data['vs_random'][-1]:.1f}%")
 
     ai = state.agent_instance
     print()
@@ -1284,6 +1314,14 @@ if __name__ == "__main__":
     parser.add_argument('--teacher', type=str, default='pubeval',
                         choices=['pubeval', 'gnubg', 'none'],
                         help='Teacher used for PPO DAGGER supervision')
+    parser.add_argument('--eval-vs', type=str, default='pubeval',
+                        choices=['pubeval', 'gnubg', 'random'],
+                        help='Secondary evaluation opponent')
+    parser.add_argument('--use-eval-lookahead', dest='use_eval_lookahead',
+                        action='store_true',
+                        help='Enable 1-ply lookahead during evaluation loops')
+    parser.add_argument('--eval-lookahead-k', type=int, default=1,
+                        help='Lookahead depth k (1 for 1-ply expectiminimax)')
     args = parser.parse_args()
 
     # CPU test mode: fast settings for debugging
@@ -1296,8 +1334,9 @@ if __name__ == "__main__":
         print("  Games: 10,000")
         print("  Eval every: 2,500 games")
         print("  Eval games: 100")
-        print("  Baseline: gnubg")
-        print("  Lookahead: disabled")
+        print(f"  Baseline: {args.eval_vs}")
+        lookahead_status = "enabled" if args.use_eval_lookahead else "disabled"
+        print(f"  Lookahead: {lookahead_status} (k={args.eval_lookahead_k})")
         print("=" * 70 + "\n")
 
         train(
@@ -1305,12 +1344,12 @@ if __name__ == "__main__":
             n_games=10_000,
             n_epochs=2_500,
             n_eval=100,
-            eval_vs="gnubg",
+            eval_vs=args.eval_vs,
             model_size='small',
             use_opponent_pool=False,   # start without pool
             pool_snapshot_every=5_000,
-            use_eval_lookahead=False,
-            eval_lookahead_k=3,
+            use_eval_lookahead=args.use_eval_lookahead,
+            eval_lookahead_k=args.eval_lookahead_k,
             use_bc_warmstart=False,
             league_checkpoint_every=10_000,
             device=args.device,
@@ -1325,13 +1364,13 @@ if __name__ == "__main__":
             n_games=args.n_games,
             n_epochs=args.n_epochs,
             n_eval=200,
-            eval_vs="gnubg",
+            eval_vs=args.eval_vs,
             model_size=args.model_size,
             use_opponent_pool=True,
             pool_snapshot_every=5_000,
             pool_max_size=12,
-            use_eval_lookahead=False,
-            eval_lookahead_k=3,
+            use_eval_lookahead=args.use_eval_lookahead,
+            eval_lookahead_k=args.eval_lookahead_k,
             device=args.device,
             agent_type=args.agent_type,
             resume=args.resume,

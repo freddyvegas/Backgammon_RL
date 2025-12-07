@@ -584,7 +584,88 @@ class PPOAgent:
 
     # -------- Utility encoders and rewards --------
     def _encode_state(self, board29, moves_left=0, actor_flag=0.0):
-        return transformer_one_hot_encoding(board29.astype(np.float32), bool(moves_left > 1), actor_flag)
+        return transformer_one_hot_encoding(
+            board29.astype(np.float32), bool(moves_left > 1), actor_flag
+        )
+
+    def _encode_batch(self, boards29: list, moves_left: int = 0, actor_flag: float = 0.0):
+        if not boards29:
+            raise ValueError("Cannot encode empty batch for transformer lookahead")
+        encoded = [self._encode_state(b, moves_left, actor_flag) for b in boards29]
+        arr = np.stack(encoded, axis=0).astype(np.float32)
+        return torch.as_tensor(arr, dtype=torch.float32, device=self.device)
+
+    @torch.no_grad()
+    def _value_from_tokens(self, token_feats: torch.Tensor) -> torch.Tensor:
+        """Run ACNet value head on encoded tokens without history context."""
+        if token_feats.ndim == 2:
+            feats = token_feats
+        elif token_feats.ndim == 3 and token_feats.size(1) == 1:
+            feats = token_feats.squeeze(1)
+        else:
+            raise ValueError("token_feats should be (B,D) or (B,1,D)")
+
+        B = feats.size(0)
+        seq_t = feats.unsqueeze(1)
+        seq_len_t = torch.ones(B, dtype=torch.int64, device=self.device)
+        cand_t = feats.unsqueeze(1)
+        mask_t = torch.ones(B, 1, dtype=torch.float32, device=self.device)
+        _, values = self.acnet(seq_t, seq_len_t, cand_t, mask_t)
+        return values.squeeze(-1)
+
+    @torch.no_grad()
+    def _evaluate_moves_lookahead(self, possible_boards: list, player: int):
+        """1-ply lookahead evaluation for transformer agent."""
+        if not possible_boards:
+            return torch.empty(0, device=self.device)
+
+        dice_rolls = [
+            (1, 1), (2, 2), (3, 3), (4, 4), (5, 5), (6, 6),
+            (1, 2), (1, 3), (1, 4), (1, 5), (1, 6), (2, 3), (2, 4), (2, 5), (2, 6),
+            (3, 4), (3, 5), (3, 6), (4, 5), (4, 6), (5, 6)
+        ]
+        dice_weights = np.array([1 if a == b else 2 for (a, b) in dice_rolls], dtype=np.float32) / 36.0
+
+        values = []
+        for board_after in possible_boards:
+            board_opp = _flip_board(board_after)
+            board_value_cache = None
+
+            def value_current():
+                nonlocal board_value_cache
+                if board_value_cache is None:
+                    feats = self._encode_batch([board_after], moves_left=0, actor_flag=0.0)
+                    board_value_cache = self._value_from_tokens(feats)[0].item()
+                return board_value_cache
+
+            opp_states = []
+            roll_ranges = []
+            for dice in dice_rolls:
+                _, opp_boards = backgammon.legal_moves(board_opp, dice, player=1)
+                start = len(opp_states)
+                if opp_boards:
+                    opp_states.extend(opp_boards)
+                roll_ranges.append((start, len(opp_states)))
+
+            if not opp_states:
+                values.append(value_current())
+                continue
+
+            opp_feats = self._encode_batch(opp_states, moves_left=0, actor_flag=0.0)
+            opp_vals = self._value_from_tokens(opp_feats)
+
+            expected = 0.0
+            for weight, (start, end) in zip(dice_weights, roll_ranges):
+                if start == end:
+                    my_val = value_current()
+                else:
+                    best_reply = torch.max(opp_vals[start:end]).item()
+                    my_val = -best_reply
+                expected += my_val * float(weight)
+
+            values.append(expected)
+
+        return torch.tensor(values, dtype=torch.float32, device=self.device)
 
     def _compute_shaped_reward(self, board_before, board_after):
         if not self.config.use_reward_shaping:
@@ -1229,10 +1310,24 @@ class PPOAgent:
         cand_t = torch.as_tensor(cand_feats[None, :, :], dtype=torch.float32, device=self.device)
         mask_t = torch.as_tensor(mask[None, :], dtype=torch.float32, device=self.device)
 
-        with torch.no_grad():
-            logits, value_t = self.acnet(seq_t, seq_len_t, cand_t, mask_t)
-            logits = logits.squeeze(0)
-            value = value_t.squeeze(0).item()
+        lookahead_config = train_config if isinstance(train_config, dict) else {}
+        use_la = bool(lookahead_config.get('use_lookahead', False))
+        la_depth = int(lookahead_config.get('lookahead_k', 1) or 1)
+
+        if (not train or self.eval_mode) and use_la and la_depth >= 1:
+            if la_depth == 1:
+                logits = self._evaluate_moves_lookahead(possible_boards, player)
+                value = torch.max(logits).item() if logits.numel() > 0 else 0.0
+            else:
+                with torch.no_grad():
+                    logits_t, value_t = self.acnet(seq_t, seq_len_t, cand_t, mask_t)
+                    logits = logits_t.squeeze(0)
+                    value = value_t.squeeze(0).item()
+        else:
+            with torch.no_grad():
+                logits_t, value_t = self.acnet(seq_t, seq_len_t, cand_t, mask_t)
+                logits = logits_t.squeeze(0)
+                value = value_t.squeeze(0).item()
 
         # Sample or greedy
         if train and not self.eval_mode:

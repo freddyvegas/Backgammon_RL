@@ -271,9 +271,10 @@ def play_games_batched(agent_obj, opponent, batch_size=8, training=True, train_c
             # A2C path: direct action calls (no batch scoring, no buffer)
             for (idx, dice, board, pmoves, pboards) in agent_envs:
                 # Agent acts directly (handles its own learning inside action())
+                action_cfg = metadata if metadata else None
                 move = agent_obj.action(
                     board, dice, +1, 0, train=training,
-                    train_config=(metadata if training else None)
+                    train_config=action_cfg
                 )
                 if not _is_empty_move(move):
                     boards[idx] = _apply_move_sequence(board, move, +1)
@@ -833,10 +834,14 @@ def play_games_batched_transformer(agent_obj, opponent, batch_size=8, training=T
 def play_one_game(agent1, agent2, training=False, commentary=False,
                   use_lookahead=False, lookahead_k=3):
     """Play one game with optional top-k lookahead (now symmetric)."""
-    from utils import _flip_board, _flip_move
-
     board = backgammon.init_board()
     player = np.random.randint(2) * 2 - 1
+    lookahead_cfg = None
+    if use_lookahead and not training:
+        lookahead_cfg = {
+            'use_lookahead': True,
+            'lookahead_k': lookahead_k
+        }
 
     if hasattr(agent1, "episode_start"): agent1.episode_start()
     if hasattr(agent2, "episode_start"): agent2.episode_start()
@@ -850,17 +855,11 @@ def play_one_game(agent1, agent2, training=False, commentary=False,
             board_copy = board.copy()
 
             if player == 1:
-                if use_lookahead and not training and hasattr(agent1, '_encode_state'):
-                    move = select_move_with_lookahead(agent1, board_copy, dice, i=r, k=lookahead_k)
-                else:
-                    move = agent1.action(board_copy, dice, player, i=r, train=training)
+                cfg = lookahead_cfg if (lookahead_cfg and hasattr(agent1, '_evaluate_moves_lookahead')) else None
+                move = agent1.action(board_copy, dice, player, i=r, train=training, train_config=cfg)
             else:
-                if use_lookahead and not training and hasattr(agent2, '_encode_state'):
-                    board_pov = _flip_board(board_copy)
-                    move_pov = select_move_with_lookahead(agent2, board_pov, dice, i=r, k=lookahead_k)
-                    move = _flip_move(move_pov)
-                else:
-                    move = agent2.action(board_copy, dice, player, i=r, train=training)
+                cfg = lookahead_cfg if (lookahead_cfg and hasattr(agent2, '_evaluate_moves_lookahead')) else None
+                move = agent2.action(board_copy, dice, player, i=r, train=training, train_config=cfg)
 
             if _is_empty_move(move):
                 continue

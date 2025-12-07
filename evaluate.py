@@ -3,7 +3,7 @@ from pathlib import Path
 from play_games import play_one_game
 
 def evaluate(agent_mod, evaluation_agent, n_eval, label="", debug_sides=False,
-             use_lookahead=False, lookahead_k=3):
+             use_lookahead=False, lookahead_k=3, quiet=False):
     """Evaluate agent with fixed side alternation."""
     wins = 0
     wins_as_p1 = 0
@@ -32,13 +32,12 @@ def evaluate(agent_mod, evaluation_agent, n_eval, label="", debug_sides=False,
     p1_wr = 100.0 * wins_as_p1 / games_as_p1 if games_as_p1 > 0 else 0
     p2_wr = 100.0 * wins_as_p2 / games_as_p2 if games_as_p2 > 0 else 0
 
-    lookahead_str = f" (k={lookahead_k} lookahead)" if use_lookahead else ""
-    print(f"{label}{lookahead_str}: {wr:.1f}%", end="")
-
-    if debug_sides:
-        print(f"  [P1: {p1_wr:.1f}% | P2: {p2_wr:.1f}%]", end="")
-
-    print()
+    if not quiet:
+        lookahead_str = f" (k={lookahead_k} lookahead)" if use_lookahead else ""
+        print(f"{label}{lookahead_str}: {wr:.1f}%", end="")
+        if debug_sides:
+            print(f"  [P1: {p1_wr:.1f}% | P2: {p2_wr:.1f}%]", end="")
+        print()
     return wr
 
 class CheckpointLeague:
