@@ -225,6 +225,13 @@ class PPOConvActorCritic(nn.Module):
         values = self.value_head(state_feat).squeeze(-1)
         return logits, values
 
+    def value(self, states):
+        """Compute value head output for encoded states."""
+        board = states[..., :self.board_dim]
+        sec_flag = states[..., self.flag_index]
+        feats = self._encode(board, sec_flag)
+        return self.value_head(feats).squeeze(-1)
+
 
 class PPOConvAgent(base_agent.PPOAgent):
     """PPO agent that swaps in the CNN actor-critic."""
