@@ -203,9 +203,9 @@ def plot_perf_multi(perf_data, start_game, n_games, n_epochs, title='Training Pe
     fig, ax = plt.subplots(figsize=(10, 6))
     
     # Plot vs Pubeval (primary baseline)
-    if 'vs_baseline' in perf_data and len(perf_data['vs_baseline']) > 0:
-        ax.plot(x_vals[:len(perf_data['vs_baseline'])], 
-                perf_data['vs_baseline'], 
+    if 'vs_pubeval' in perf_data and len(perf_data['vs_pubeval']) > 0:
+        ax.plot(x_vals[:len(perf_data['vs_pubeval'])], 
+                perf_data['vs_pubeval'], 
                 'o-', label='vs Pubeval', linewidth=2, markersize=6)
     
     # Plot vs Random
