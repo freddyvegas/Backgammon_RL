@@ -47,7 +47,9 @@ def _flip_board(board: np.ndarray) -> np.ndarray:
 
 
 def _flip_move(move: Sequence[Sequence[int]]) -> List[List[int]]:
-    if not move:
+    if move is None:
+        return []
+    if hasattr(move, "__len__") and len(move) == 0:
         return []
     flipped = []
     for step in move:
